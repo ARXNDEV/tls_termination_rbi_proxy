@@ -1,0 +1,34 @@
+# ---- secrets / private key material (NEVER commit) ----
+Gatesentry/config.json
+Gatesentry/rbi/rbi.env
+*.key.pem
+Accops_TLS_Termination.key.pem
+*.pem.key
+*_private*.pem
+
+# ---- build artifacts / binaries ----
+Gatesentry/bin/
+bin/
+*.exe
+gatesentrybin
+gatesentrybin.exe
+Gatesentry/gatesentry
+*.o
+*.test
+
+# ---- logs / databases / coverage ----
+*.log
+log.db
+log.txt
+coverage.txt
+Gatesentry/GSUpdateLog
+
+# ---- demo / capture artifacts ----
+rbi-*.png
+Gatesentry/rbi-*.png
+Gatesentry/rbi-demo-screenshot.png
+*.xwd
+
+# ---- OS / editor cruft ----
+.DS_Store
+*.swp
