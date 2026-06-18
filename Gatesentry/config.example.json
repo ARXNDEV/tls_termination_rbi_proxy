@@ -1,0 +1,43 @@
+{
+  "google_allowed_domains": [
+    "gmail.com",
+    "example.com"
+  ],
+  "pac_file_data": "function FindProxyForURL(url, host) { return \"PROXY localhost:8080\"; }",
+  "cert_data": "REPLACE_WITH_BASE64_PEM",
+  "key_data": "REPLACE_WITH_BASE64_PEM",
+  "Port": 8080,
+  "ConfigDir": ".",
+  "blockedsites": {
+    "keywords": [
+      {
+        "Content": "facebook.com",
+        "Score": 1
+      },
+      {
+        "Content": "logs.accops.com",
+        "Score": 1
+      }
+    ]
+  },
+  "donotbump": {
+    "keywords": [
+      {
+        "Content": "redmine.accops.com",
+        "Score": 2
+      },
+      {
+        "Content": "gos.accops.com",
+        "Score": 2
+      }
+    ]
+  },
+  "exceptionsitelist": {
+    "keywords": [
+      {
+        "Content": "portal.accops.com",
+        "Score": 0
+      }
+    ]
+  }
+}
