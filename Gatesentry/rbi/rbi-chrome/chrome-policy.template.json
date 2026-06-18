@@ -1,0 +1,40 @@
+{
+  "_comment": "Rendered by entrypoint.sh via envsubst. Authoritative URL lockdown + forced egress proxy for the isolated Chrome.",
+
+  "URLBlocklist": ["*"],
+  "URLAllowlist": ["${ALLOWED_HOST}", "https://${ALLOWED_HOST}/*", "http://${ALLOWED_HOST}/*"],
+
+  "RestoreOnStartup": 4,
+  "RestoreOnStartupURLs": ["https://${ALLOWED_HOST}/"],
+  "HomepageLocation": "https://${ALLOWED_HOST}/",
+  "HomepageIsNewTabPage": false,
+  "NewTabPageLocation": "https://${ALLOWED_HOST}/",
+
+  "ProxySettings": {
+    "ProxyMode": "fixed_servers",
+    "ProxyServer": "${PROXY_HOST}:${PROXY_PORT}",
+    "ProxyBypassList": ""
+  },
+
+  "DeveloperToolsAvailability": 2,
+  "DownloadRestrictions": 3,
+  "AllowFileSelectionDialogs": false,
+  "DefaultPopupsSetting": 2,
+  "DefaultNotificationsSetting": 2,
+  "DefaultGeolocationSetting": 2,
+  "DefaultJavaScriptSetting": 1,
+  "IncognitoModeAvailability": 1,
+  "BrowserSignin": 0,
+  "SyncDisabled": true,
+  "PasswordManagerEnabled": false,
+  "AutofillAddressEnabled": false,
+  "AutofillCreditCardEnabled": false,
+  "PrintingEnabled": false,
+  "BackgroundModeEnabled": false,
+  "MetricsReportingEnabled": false,
+  "DefaultBrowserSettingEnabled": false,
+  "PromotionalTabsEnabled": false,
+  "BookmarkBarEnabled": false,
+  "TranslateEnabled": false,
+  "SafeBrowsingProtectionLevel": 1
+}
