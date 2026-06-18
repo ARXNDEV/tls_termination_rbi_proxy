@@ -1,0 +1,40 @@
+# RBI control plane. Per-session browser containers are created at runtime by the
+# Gatesentry controller (docker run) onto gs-isolated; not defined here.
+# All shared values come from rbi.env (single source of truth).
+services:
+  gatesentry:
+    image: gatesentry:rbi            # built from ../Dockerfile.rbi (Go binary incl. controller/ + two listeners)
+    restart: unless-stopped
+    env_file: [rbi.env]              # RBI_*, NEKO_*, COTURN_*, TURN_SECRET, PUBLIC_IP ...
+    networks: [gs-edge, gs-isolated]
+    ports:
+      - "${RBI_CLIENT_PORT}:8080"    # client-facing RBI proxy (user browser → here)  [RBI ON]
+      - "${RBI_VIEWER_PORT}:8081"    # RBI viewer page
+      # RBI_EGRESS_PORT (3129) is deliberately NOT published — reachable only on gs-isolated [RBI OFF]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock   # controller spawns/destroys sessions
+      # SECURITY: docker.sock ~= host root. In prod front it with a scoped docker-socket-proxy.
+      - ./gatesentry-config:/app/config:ro
+
+  coturn:
+    image: coturn/coturn:4.6
+    restart: unless-stopped
+    env_file: [rbi.env]
+    networks: [gs-edge, gs-isolated]
+    ports:
+      - "${RBI_TURN_PORT}:3478/tcp"
+      - "${RBI_TURN_PORT}:3478/udp"
+      - "${COTURN_RELAY_MIN}-${COTURN_RELAY_MAX}:${COTURN_RELAY_MIN}-${COTURN_RELAY_MAX}/udp"  # relay range (== rbi.env)
+    volumes:
+      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    command: >
+      -c /etc/coturn/turnserver.conf
+      --min-port=${COTURN_RELAY_MIN} --max-port=${COTURN_RELAY_MAX}
+      --realm=${TURN_REALM:-rbi.local} --static-auth-secret=${TURN_SECRET} --external-ip=${PUBLIC_IP}
+
+networks:
+  gs-edge:
+    driver: bridge
+  gs-isolated:
+    driver: bridge
+    internal: true        # no internet gateway; web reachable only via the proxy
