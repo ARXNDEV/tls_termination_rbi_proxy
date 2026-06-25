@@ -10,7 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os/exec"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -314,6 +314,12 @@ func (h ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// urlHostBytes := []byte(r.URL.Host)
 	// shouldMitm, _ := IProxy.RunHandler("mitm", "", &urlHostBytes, passthru)
 	shouldMitm := IProxy.DoMitm(r.URL.Host)
+	// RBI: only bump/isolate the configured target hosts; tunnel everything else
+	// (the proxied browser's telemetry/fonts/googleapis background traffic) so we
+	// don't spawn a container per host and flood/starve the real session.
+	if shouldMitm && !rbiShouldIsolate(r.URL.Host) {
+		shouldMitm = false
+	}
 	log.Println("[TEST] Should MITM = ", shouldMitm, " currentAction = "+action, " for ", r.URL.String())
 
 	if isHostLanAddress {
@@ -361,55 +367,100 @@ func (h ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	isTopLevelNav := secDest == "document" ||
 		(secDest == "" && strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/html"))
 
-	// Every top-level navigation is isolated into its OWN throwaway per-session
-	// container and opened in a NEW window. Sub-resource/asset/XHR requests are not
-	// document navigations, so they never trigger isolation.
-	modifyURL := isTopLevelNav
+	// RBI isolation applies ONLY to hosts on the allowlist (rbiShouldIsolate).
+	// Everything else — including the proxied browser's plain-HTTP telemetry
+	// (clients2.google.com/time, *.gvt1.com extension updates, etc.) — must be
+	// proxied straight through to its real origin, NOT forwarded to a container,
+	// or every background host spawns its own throwaway session and floods/starves
+	// the real stream. HTTPS is already gated via shouldMitm above, but plain-HTTP
+	// requests fall through to here and need their own allowlist gate.
+	rbiIsolate := rbiShouldIsolate(r.URL.Host)
+
+	// Every top-level navigation to an ISOLATED host is turned into its OWN throwaway
+	// per-session container and opened in a NEW window. Sub-resource/asset/XHR
+	// requests are not document navigations, so they never trigger isolation.
+	modifyURL := isTopLevelNav && rbiIsolate
 
 	actual_url := r.URL.Scheme + "://" + r.URL.Host + string(r.URL.Path)
 	var originalTitle string
-	var favicondata string
-	var favicon string
+	var rbiFavURL string
 	if modifyURL {
-		log.Println("Fetching original page to extract title")
+		var favRel string
+		originalTitle, favRel = fetchPageMetadata(actual_url)
+		// Resolve the site's declared favicon to an absolute URL on its REAL origin.
+		favAbs := favRel
+		switch {
+		case favRel == "":
+			favAbs = r.URL.Scheme + "://" + r.URL.Host + "/favicon.ico"
+		case strings.HasPrefix(favRel, "http://"), strings.HasPrefix(favRel, "https://"):
+			// already absolute
+		case strings.HasPrefix(favRel, "//"):
+			favAbs = r.URL.Scheme + ":" + favRel
+		case strings.HasPrefix(favRel, "/"):
+			favAbs = r.URL.Scheme + "://" + r.URL.Host + favRel
+		default:
+			favAbs = r.URL.Scheme + "://" + r.URL.Host + "/" + favRel
+		}
+		// Embed the favicon as a self-contained data: URI. If we instead handed the
+		// client the favicon URL on the isolated host, the tab-icon request would be
+		// proxy-forwarded to the neko container and the tab would show NEKO's icon
+		// instead of the site's. The server-side fetch hits the site's real origin.
+		if dataURI, ferr := fetchFaviconBase64(favAbs); ferr == nil && dataURI != "" {
+			rbiFavURL = dataURI
+		} else {
+			rbiFavURL = favAbs
+			log.Printf("[rbi] favicon base64 fetch failed for %s: %v", favAbs, ferr)
+		}
+		log.Printf("[rbi] isolating top-level nav: %s (title=%q fav=%dB)", actual_url, originalTitle, len(rbiFavURL))
+	}
 
-		originalTitle, favicon = fetchPageMetadata(actual_url)
+	// Neko's viewer derives its asset + signaling-WebSocket base from the PAGE PATH
+	// (location.pathname), not from <base>. Served under a sub-path (e.g. /gather) it
+	// requests /gather/ws + /gather/*.json which 404 -> the stream never connects
+	// (black screen). So for an isolated TOP-LEVEL nav whose path isn't root, launch
+	// the session (the container still opens the FULL path) and 302-redirect the
+	// CLIENT to the host root, so the viewer loads at "/" and neko connects cleanly.
+	// (The host-keyed session is reused by the follow-up root request — same container.)
+	if modifyURL && r.URL.Path != "" && r.URL.Path != "/" {
+		if _, lerr := rbiLaunchSession(actual_url); lerr != nil {
+			log.Printf("[rbi] launch failed for %s: %v", actual_url, lerr)
+			http.Error(w, "RBI session failed to start: "+lerr.Error(), http.StatusBadGateway)
+			return
+		}
+		rootURL := r.URL.Scheme + "://" + r.URL.Host + "/"
+		log.Printf("[rbi] sub-path isolated nav -> redirect client to root: %s -> %s", actual_url, rootURL)
+		http.Redirect(w, r, rootURL, http.StatusFound)
+		return
+	}
 
-		favicon_url := r.URL.Scheme + "://" + r.URL.Host + string(favicon)
-		favicondata, err = fetchFaviconBase64(favicon_url)
-		log.Printf("Original title, favicon : %s %s", originalTitle, favicon)
-
-		// Launch a FRESH per-session container (complete Chromium, kiosk-locked to
-		// this URL) and return a page that opens its stream in a NEW window. This
-		// fully replaces the old shared `docker exec rbi-open` + :8081 forward.
-		sess, lerr := rbiLaunchSession(actual_url)
+	// PROXY-FORWARD: for an ISOLATED host, every request is reverse-proxied to its
+	// per-session container, so the stream is served on the SITE's OWN origin — the
+	// client's URL bar stays youtube.com / www.google.com (no localhost). Launch or
+	// reuse the host's throwaway container (host-keyed). Non-isolated hosts skip this
+	// block entirely and are proxied to their real origin by the RoundTrip below.
+	if rbiIsolate {
+		rbiSess, lerr := rbiLaunchSession(actual_url)
 		if lerr != nil {
 			log.Printf("[rbi] launch failed for %s: %v", actual_url, lerr)
 			IProxy.LogHandler(GSLogData{Url: actual_url, User: user, Action: ProxyActionFilterNone})
 			http.Error(w, "RBI session failed to start: "+lerr.Error(), http.StatusBadGateway)
 			return
 		}
-		page := rbiViewerPage(originalTitle, actual_url, sess.tcpPort)
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(page))
-		return
+
+		// Set the forwarding target = this session's neko container. When the proxy
+		// itself runs in Docker, RBI_FORWARD_HOST=host.docker.internal lets it reach
+		// the per-session containers' host-published ports.
+		forwardHost := rbiEnv("RBI_FORWARD_HOST", "127.0.0.1")
+		forwardPort := strconv.Itoa(rbiSess.tcpPort)
+
+		// Update the request URL and host to point at this session's container.
+		r.Host = forwardHost
+		r.URL.Host = net.JoinHostPort(forwardHost, forwardPort)
+		r.URL.Scheme = "http"
+		r.Proto = "HTTP/1.1"
+		r.ProtoMajor = 1
+		r.ProtoMinor = 1
 	}
-	_ = favicondata // retained for non-RBI rewrite paths below
-
-	// Set the forwarding target
-	forwardHost := "127.0.0.1" // Replace with your desired host
-	forwardPort := "8081"            // Set the port if needed (443 for HTTPS, 80 for HTTP)
-
-	// Update the request URL and host
-
-	r.Host = forwardHost
-	r.URL.Host = net.JoinHostPort(forwardHost, forwardPort)
-	r.URL.Scheme = "http"
-	r.Proto = "HTTP/1.1"
-	r.ProtoMajor = 1
-	r.ProtoMinor = 1
 
 	if r.Header.Get("Upgrade") == "websocket" {
 		log.Println("websocket is  supported....")
@@ -500,30 +551,50 @@ func (h ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	localCopyData, err := io.ReadAll(teeReader)
 
 	//log.Printf("localCopyData is  %s", localCopyData)
-	if modifyURL {
-		log.Printf("new RBI_URL is  %s", actual_url)
-		// Only rewrite HTML responses; applying these string replacements to
-		// JS/JSON/binary bodies could corrupt them.
-		if strings.Contains(contentType, "html") {
-			localCopyData = []byte(strings.ReplaceAll(string(localCopyData), "RBI_URL", actual_url))
-			localCopyData = []byte(replaceTitle(string(localCopyData), string(originalTitle)))
-			localCopyData = []byte(strings.ReplaceAll(string(localCopyData), "<link rel=\"icon\"", "<link rel=\"icon\" href=\""+string(favicondata)+"\""))
+	if modifyURL && strings.Contains(contentType, "html") {
+		// Inject the SITE's real title + favicon into the served neko viewer HTML so
+		// the tab reads e.g. "YouTube". The in-image script reads window.__rbi_title /
+		// __rbi_fav and also auto-logs-in (adds usr/pwd client-side, then strips them)
+		// so the URL bar stays the site's URL with no credentials leaked.
+		qt := strings.ReplaceAll(strconv.Quote(originalTitle), "</", "<\\/")
+		qf := strings.ReplaceAll(strconv.Quote(rbiFavURL), "</", "<\\/")
+		// Neko's viewer ships several <link rel=icon> tags (favicon-32x32.png …) and
+		// Chrome uses the rel="icon" ones for the tab icon. Strip them all and inject a
+		// single data:-URI favicon for the real site, so the tab shows e.g. YouTube's
+		// icon instead of neko's. (The baked JS tick only touched the FIRST icon link —
+		// apple-touch-icon — so it never replaced the real favicon.)
+		favLink := ""
+		if strings.HasPrefix(rbiFavURL, "data:") {
+			favLink = "<link rel=\"icon\" href=\"" + rbiFavURL + "\">"
 		}
-		resp.Header.Add("Set-Cookie", "rbi_accops=true; Path=/; Secure; SameSite=None")
-
-		// modifyURL already implies a top-level navigation (see gating above), so
-		// steer the isolated browser to this URL via the kiosk launcher baked into
-		// the image (rbi-open): Google Chrome in --kiosk --app mode — ONLY this URL,
-		// no tabs, no address bar. Runs as "ubuntu" on DISPLAY :20 (captured by
-		// selkies). Sub-resource/telemetry requests don't reach here, so they can't
-		// hijack the kiosk.
-		go func(u string) {
-			log.Printf("Triggering local virtual browser to navigate to: %s", u)
-			cmd := exec.Command("docker", "exec", "-u", "ubuntu", "-e", "DISPLAY=:20", "neko-master2-firefox-1", "rbi-open", u)
-			if err := cmd.Run(); err != nil {
-				log.Printf("Failed to navigate virtual browser: %v", err)
-			}
-		}(actual_url)
+		// Camera-relay URL for the in-tab auto-camera (inject-head.html autoCam). The
+		// relay runs on the VM host; the client reaches it at the same IP it uses for
+		// WebRTC (RBI_NAT1TO1). Empty on loopback-only setups -> autoCam stays off.
+		camURL := ""
+		if ip := os.Getenv("RBI_NAT1TO1"); ip != "" && ip != "127.0.0.1" {
+			camURL = "wss://" + ip + ":8443/ws"
+		}
+		// __rbi_cam="" DISABLES the baked (unreliable, on-demand control-channel) camStart
+		// in inject-head.html; the proxy now drives a RELIABLE warm camera (rbiWarmCamera)
+		// off __rbi_cam_url instead. Deployed via `go build` + proxy restart — no image rebuild.
+		inject := favLink + "<script>window.__rbi_title=" + qt + ";window.__rbi_fav=" + qf + ";window.__rbi_cam=\"\";window.__rbi_cam_url=" + strconv.Quote(camURL) + ";</script>" + rbiWarmCamera + "</head>"
+		s := string(localCopyData)
+		s = rbiIconLinkRe.ReplaceAllString(s, "")
+		// Neko's viewer, its assets and its signaling WebSocket are all ROOT-relative.
+		// When the isolated URL has a sub-path (e.g. teams.live.com/gather), the browser
+		// resolves them under /gather/ and they 404 -> WS never connects -> black screen.
+		// Force a root <base> so every relative URL maps to the host root (a no-op for
+		// sites isolated at "/").
+		if i := strings.Index(s, "<head>"); i >= 0 {
+			// rbiConsoleRebrand must be the FIRST thing in <head> so it overrides
+			// console.* BEFORE neko's bundle captures a reference to it — otherwise
+			// neko logs via its own saved console and bypasses any later override.
+			s = s[:i+len("<head>")] + rbiConsoleRebrand + "<base href=\"/\">" + s[i+len("<head>"):]
+		}
+		if strings.Contains(s, "</head>") {
+			s = strings.Replace(s, "</head>", inject, 1)
+		}
+		localCopyData = []byte(s)
 	}
 
 	if err != nil {
@@ -737,6 +808,33 @@ func extractFavicon(body string) string {
 // rbiFetchClient is used for the server-side RBI metadata/favicon fetches; it
 // has a timeout so a slow target cannot hang the request handler indefinitely.
 var rbiFetchClient = &http.Client{Timeout: 10 * time.Second}
+
+// rbiIconLinkRe matches any <link ... rel="...icon..."> tag (icon, shortcut icon,
+// apple-touch-icon, mask-icon) so the neko viewer's OWN favicons can be stripped
+// from the served HTML and replaced with the isolated site's real icon.
+var rbiIconLinkRe = regexp.MustCompile(`(?i)<link\b[^>]*\brel=["'][^"']*icon[^"']*["'][^>]*>`)
+
+// rbiConsoleRebrand is injected as the FIRST element inside <head> (before neko's
+// own bundle runs) so it wraps console.* BEFORE neko captures a reference to it —
+// otherwise neko logs through its own saved console and bypasses a later override.
+// It white-labels the browser console: rebrands neko's "[NEKO]" log prefix (and any
+// "neko" text) to the product name in orange, and drops the benign early
+// RTCDataChannel race errors that fire before the data channel opens.
+const rbiConsoleRebrand = `<script>(function(){try{var BR="Accops HySecure Dev",OR="color:#F26522;font-weight:bold";var DROP=/RTCDataChannel|InvalidStateError|readyState|sendData/;var rep=function(x){return (typeof x==="string")?x.replace(/\[NEKO\]/g,"["+BR+"]").replace(/n\.?eko/gi,BR):x;};["log","debug","info","warn","error","trace"].forEach(function(m){var o=console[m]?console[m].bind(console):function(){};console[m]=function(){try{var s="";for(var i=0;i<arguments.length;i++){s+=" "+arguments[i];}if(DROP.test(s))return;var a=Array.prototype.slice.call(arguments);if(typeof a[0]==="string"&&a[0].indexOf("%c")<0&&/\[NEKO\]|n\.?eko/i.test(a[0])){var t=a[0].replace(/\[NEKO\]/g,"["+BR+"]").replace(/n\.?eko/gi,BR);return o.apply(null,["%c"+t,OR].concat(a.slice(1)));}for(var j=0;j<a.length;j++){a[j]=rep(a[j]);}return o.apply(null,a);}catch(_){return o.apply(null,arguments);}};});}catch(e){}})();</script>`
+
+// rbiWarmCamera is injected just before </head> (after __rbi_cam_url is set). neko v3 has no
+// client webcam send-path, so on camera-relevant sites we capture the user's REAL camera
+// (preferring a non-virtual device), with an 8s getUserMedia timeout + retry, and stream JPEG
+// frames over wss to the camrelay /ws (which feeds /dev/video10 in the container). It is WARM:
+// it fires on the FIRST user gesture (like the always-reliable mic) instead of the fragile
+// on-demand control channel, and the WS auto-reconnects. This is what makes the camera reliable.
+const rbiWarmCamera = `<script>(function(){try{var U=window.__rbi_cam_url||"";if(!U)return;if(!/teams|meet\.google|webcam|zoom|webex|whereby|skype|jitsi/i.test(location.hostname))return;var started=false;function pick(){return navigator.mediaDevices.enumerateDevices().then(function(ds){var vs=ds.filter(function(d){return d.kind==="videoinput";});var r=vs.find(function(d){return /facetime|built-in|macbook|internal/i.test(d.label);})||vs.find(function(d){return d.label&&!/obs|virtual|snap|manycam|loopback/i.test(d.label);});return r?r.deviceId:null;}).catch(function(){return null;});}function go(){if(started)return;started=true;pick().then(function(id){var c={video:{width:640,height:480,frameRate:15}};if(id)c.video.deviceId={ideal:id};var to=new Promise(function(_,r){setTimeout(function(){r(new Error("to"));},8000);});Promise.race([navigator.mediaDevices.getUserMedia(c),to]).then(function(s){var cv=document.createElement("canvas");cv.width=640;cv.height=480;var x=cv.getContext("2d");var hf=false;var trk=s.getVideoTracks()[0];function vidFallback(){var v=document.createElement("video");v.srcObject=s;v.muted=true;v.playsInline=true;v.autoplay=true;v.setAttribute("style","position:fixed;left:0;top:0;width:64px;height:48px;opacity:0.02;pointer-events:none;z-index:-1");document.body.appendChild(v);v.play().catch(function(){});setInterval(function(){if(v.videoWidth){try{x.drawImage(v,0,0,640,480);hf=true;}catch(_){}}},66);}if(window.MediaStreamTrackProcessor){try{var rd=new MediaStreamTrackProcessor({track:trk}).readable.getReader();(function pump(){rd.read().then(function(r){if(r.done)return;try{x.drawImage(r.value,0,0,640,480);hf=true;}catch(_){}try{r.value.close();}catch(_){}pump();}).catch(function(){});})();}catch(e){vidFallback();}}else{vidFallback();}function conn(){var ws;try{ws=new WebSocket(U);}catch(e){setTimeout(conn,1500);return;}ws.binaryType="arraybuffer";var t=null;ws.onopen=function(){t=setInterval(function(){if(ws.readyState!==1||!hf)return;try{cv.toBlob(function(b){if(b)b.arrayBuffer().then(function(a){try{ws.send(a);}catch(_){}});},"image/jpeg",0.6);}catch(_){}},66);};ws.onclose=function(){if(t){clearInterval(t);t=null;}setTimeout(conn,1500);};ws.onerror=function(){try{ws.close();}catch(_){}};}conn();}).catch(function(){started=false;setTimeout(go,3000);});});}["click","keydown","pointerdown"].forEach(function(e){document.addEventListener(e,go);});}catch(e){}})();</script>`
+
+// NOTE: webcam passthrough was tested and is NOT achievable with neko v3's stock
+// client — it has a mic toggle but no webcam control and only forwards the audio
+// track when sharing, so an injected getUserMedia video track is dropped and never
+// reaches the server's v4l2loopback feed (/dev/video10 stays empty). Camera would
+// need a forked neko client or a different streamer (Kasm). Mic works fully.
 
 func fetchPageMetadata(targetURL string) (string, string) {
 	resp, err := rbiFetchClient.Get(targetURL)

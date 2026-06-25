@@ -33,6 +33,13 @@ fi
 mkdir -p "$CHROME_POLICY_DIR"
 POLICY_FILE="$CHROME_POLICY_DIR/policy.json"
 
+# The base neko image ships its OWN managed policy (e.g. policies.json: extension
+# force-installs + a different URL allow/blocklist). Chrome MERGES every *.json in
+# the managed dir, and that stale file intermittently BLOCKS the allowed site
+# ("This page is blocked"). Remove any pre-existing managed policy files so ONLY our
+# rendered policy.json governs the kiosk.
+find "$CHROME_POLICY_DIR" -maxdepth 1 -type f -name '*.json' ! -name 'policy.json' -delete 2>/dev/null || true
+
 ALLOWED_HOST="$(printf '%s' "$ALLOWED_URL" | sed -E 's#^[A-Za-z]+://##; s#/.*$##; s#:[0-9]+$##')"
 [ -n "$ALLOWED_HOST" ] || fail "cannot derive host from ALLOWED_URL=$ALLOWED_URL"
 log "host=$ALLOWED_HOST egress=$PROXY_HOST:$PROXY_PORT turn=$TURN_HOST:$TURN_PORT (relay model)"
@@ -113,6 +120,20 @@ else
   log "managed policy rendered at $POLICY_FILE (proxy ${PROXY_HOST}:${PROXY_PORT}):"; cat "$POLICY_FILE" >&2
 fi
 
+# MULTI-DOMAIN sites: Teams (login.live.com, teams.microsoft.com, *.office.net) and
+# YouTube (googlevideo.com video, i.ytimg.com thumbnails, consent.youtube.com,
+# accounts.google.com, gstatic.com) span MANY domains. A single-host URLAllowlist +
+# URLBlocklist:["*"] blocks those -> video/consent/login fail ("This page is blocked").
+# So for these sites drop the URLBlocklist and allow ALL navigation. The kiosk WINDOW
+# lock (no tabs/omnibox for the client) AND the container isolation still apply — only
+# the per-URL allowlist is lifted. DEMO use only.
+case "$ALLOWED_HOST" in
+  teams.live.com|teams.microsoft.com|www.youtube.com|youtube.com|m.youtube.com|meet.google.com)
+    sed -i 's/"URLBlocklist": \[[^]]*\]/"URLBlocklist": []/' "$POLICY_FILE"
+    log "multi-domain site ($ALLOWED_HOST): URL lockdown relaxed (full site flow allowed)"
+    ;;
+esac
+
 # ---- trust the proxy CA in the browser user's NSS db -------------------------
 # Chromium on Linux validates TLS against its per-user NSS store, NOT the system
 # CA bundle. Without this the bumping proxy's minted leaves -> ERR_CERT_AUTHORITY_INVALID.
@@ -138,11 +159,65 @@ KIOSK_CONF=/etc/neko/supervisord/chromium.conf
 if [ -f "$KIOSK_TMPL" ] && [ -d "$(dirname "$KIOSK_CONF")" ]; then
   ALLOWED_URL="$ALLOWED_URL" envsubst '${ALLOWED_URL}' < "$KIOSK_TMPL" > "$KIOSK_CONF" \
     || fail "kiosk conf render failed"
-  grep -q -- "--app=$ALLOWED_URL" "$KIOSK_CONF" || fail "kiosk conf missing --app=$ALLOWED_URL"
+  grep -q -- "$ALLOWED_URL" "$KIOSK_CONF" || fail "kiosk conf missing $ALLOWED_URL"
+  # Teams refuses to enable in-page audio/video on browsers it deems "unsupported"
+  # (old/mobile UA -> "Unsupported Browser" wall, media disabled). Force a RECENT
+  # EDGE desktop UA for teams sessions — Edge is Teams' first-class browser, so the
+  # web meeting client loads with mic/camera enabled. (The template default is already
+  # this same Edge UA; this keeps teams correct even if that default changes.)
+  case "$ALLOWED_HOST" in
+    teams.live.com|teams.microsoft.com)
+      sed -i 's#--user-agent="[^"]*"#--user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0"#' "$KIOSK_CONF"
+      log "teams session: recent Edge desktop user-agent forced (supported-browser + media)"
+      ;;
+  esac
   log "kiosk locked to $ALLOWED_URL (no tabs/omnibox):"; grep -m1 'command=/usr/bin/chromium' "$KIOSK_CONF" >&2
 else
   log "WARN: kiosk template or supervisor dir missing — browser will not be kiosk-locked"
 fi
+
+# ---- template the camera-relay control URL into the in-container extension ---
+# ext/content.js ships a __RBI_CONTROL_URL__ placeholder (with a hardcoded fallback).
+# Point it at THIS deployment's relay so the camera works on any VM, not just the one
+# baked into the fallback. The relay runs on the same host the client reaches for media
+# (NEKO_WEBRTC_NAT1TO1). Best-effort; the in-file fallback covers the unset case.
+CONTROL_HOST="${RBI_CONTROL_HOST:-${NEKO_WEBRTC_NAT1TO1:-}}"
+if [ -f /opt/rbi/ext/content.js ] && [ -n "$CONTROL_HOST" ] && [ "$CONTROL_HOST" != "127.0.0.1" ]; then
+  sed -i "s#__RBI_CONTROL_URL__#wss://${CONTROL_HOST}:8443/control?role=pub#" /opt/rbi/ext/content.js \
+    && log "camera control URL templated -> wss://${CONTROL_HOST}:8443/control?role=pub" \
+    || log "WARN: could not template control URL (extension keeps its built-in fallback)"
+fi
+
+# ---- make the client-mic virtual source the DEFAULT input -------------------
+# neko pipes the client's microphone into the 'microphone' pulse virtual-source.
+# Set it as the DEFAULT source so Teams/web apps auto-pick it as the mic. Pulse
+# starts under the supervisor (after the exec below), so wait for it in a detached
+# subshell (which survives exec) then set the default. Best-effort; never fatal.
+(
+  for _ in $(seq 1 40); do
+    for sock in /tmp/pulseaudio.socket /run/user/*/pulse/native /var/run/pulse/native; do
+      [ -S "$sock" ] && export PULSE_SERVER="unix:$sock"
+    done
+    if pactl info >/dev/null 2>&1; then
+      # Prefer the REAL "microphone" virtual-source as the default input — NOT the
+      # *.monitor sources. getUserMedia (Teams/Meet) works with either, but Chrome's
+      # Web Speech engine (YouTube/Google voice search) does NOT capture from a monitor
+      # source, so it must see a real source. Also boost the gain: the relayed client
+      # mic arrives quiet, and speech recognition needs an audible level.
+      if pactl list short sources 2>/dev/null | awk '{print $2}' | grep -qx microphone; then
+        pactl set-default-source microphone >/dev/null 2>&1
+        pactl set-source-volume microphone 300% >/dev/null 2>&1
+        pactl set-source-volume audio_input.monitor 300% >/dev/null 2>&1
+        echo "[rbi-entrypoint] default pulse source = microphone (real source, gain 300%)" >&2; break
+      fi
+      # fallback if the named source isn't present yet
+      mic=$(pactl list short sources 2>/dev/null | awk '{print $2}' | grep -iE 'audio_input|microphone|mic' | head -1)
+      [ -z "$mic" ] && mic=microphone
+      pactl set-default-source "$mic" >/dev/null 2>&1 && { echo "[rbi-entrypoint] default pulse source = $mic" >&2; break; }
+    fi
+    sleep 1
+  done
+) >/dev/null 2>&1 &
 
 # ---- hand off to neko (version-specific exec, single-sourced) ----------------
 log "exec $NEKO_SUPERVISORD_BIN -c $NEKO_SUPERVISORD_CONF"

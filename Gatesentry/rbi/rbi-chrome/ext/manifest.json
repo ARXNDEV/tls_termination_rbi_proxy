@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "RBI Media Bridge",
+  "version": "1.0",
+  "description": "Detects when the isolated page uses camera/mic and signals the host so the user's real device is captured only on demand.",
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "run_at": "document_start",
+      "all_frames": false,
+      "js": ["content.js"]
+    }
+  ],
+  "web_accessible_resources": [
+    { "resources": ["inject.js"], "matches": ["<all_urls>"] }
+  ],
+  "host_permissions": ["<all_urls>"]
+}

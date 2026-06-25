@@ -32,3 +32,6 @@ Gatesentry/rbi-demo-screenshot.png
 # ---- OS / editor cruft ----
 .DS_Store
 *.swp
+
+# editor cruft
+.vs/

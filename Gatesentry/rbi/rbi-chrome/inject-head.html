@@ -1,0 +1,174 @@
+<style>
+html,body{margin:0!important;padding:0!important;overflow:hidden!important;background:#000!important}
+#glass-fence{background:#000!important}
+[class*="fa-"]{display:none!important}
+.grid-topnav,.grid-bottom,.grid-sidebar,.sidebar,.connect,.isolated-badge,.status-indicators,.status-clean,.top-bar,.video-top-bar,.mono-url,.url-info,.bottom-bar,.actions,.action-btn,.video-menu,.loading,.vue-notification-group,.vue-notification-wrapper,.vue-notification,.notifications,.notification-title,.notification-content{display:none!important}
+#glass-fence *{visibility:hidden!important}
+#glass-fence .player,#glass-fence .player *,#glass-fence .player-container,#glass-fence .player-container *,#glass-fence video{visibility:visible!important}
+.grid-content{display:-webkit-box!important;display:flex!important}
+.grid-video{-webkit-box-flex:1!important;-ms-flex:1 1 100%!important;flex:1 1 100%!important;width:100%!important;max-width:none!important;border:0!important}
+.layout-grid{height:100vh!important;width:100vw!important}
+.player,.player-aspect,.player-container{position:static!important;width:100vw!important;height:100vh!important;max-width:none!important;padding:0!important;margin:0!important}
+/* video just displays the stream and must NOT capture clicks */
+#glass-fence video{position:fixed!important;top:0!important;left:0!important;width:100vw!important;height:100vh!important;object-fit:fill!important;z-index:1!important;background:#000!important;pointer-events:none!important}
+.player-overlay{position:fixed!important;top:0!important;left:0!important;width:100vw!important;height:100vh!important;background:transparent!important;z-index:2!important;pointer-events:none!important}
+/* neko's real mouse-input element is <textarea class="overlay"> — it MUST sit on
+   top (z-index:3) and receive pointer events, or the cursor/mouse is dead */
+.overlay,#glass-fence textarea.overlay,#glass-fence .player-container .overlay{position:fixed!important;top:0!important;left:0!important;width:100vw!important;height:100vh!important;background:transparent!important;border:0!important;outline:none!important;resize:none!important;z-index:3!important;pointer-events:auto!important;visibility:visible!important;cursor:default!important}
+/* SINGLE CURSOR = the Mac's LOCAL OS cursor only (instant, no lag). Force
+   cursor:default on EVERY element so any neko remote-cursor CSS (which it sets as a
+   data-URL on the overlay/video) is overridden, and the video is captured with
+   show-pointer=false (no baked cursor). Result: exactly one local arrow cursor. */
+html,body,#glass-fence,video,canvas,.player,.player-aspect,.player-container,.player-overlay,.overlay,textarea.overlay,*{cursor:default!important}
+/* Mic is auto-shared on the first interaction (see autoMic in JS) so no button is
+   needed — keep neko's control bar fully hidden for the seamless look. The hidden mic
+   toggle is clicked programmatically inside a real user gesture, so getUserMedia is
+   allowed (the browser still shows its one-time per-site permission prompt). */
+.controls{display:none!important}
+</style>
+<script>
+(function(){
+  // FORCE REAL MIC + CAMERA: the client's DEFAULT input may be a VIRTUAL device
+  // (BlackHole / Teams-virtual / aggregate for audio; OBS / Snap / ManyCam for video)
+  // that carries NO real signal -> the isolated app's mic/voice-search hear silence and
+  // its camera shows a blank/virtual feed. Wrap getUserMedia so any capture that lands on
+  // a virtual device is re-acquired from a REAL hardware device (built-in preferred).
+  // enumerateDevices only exposes labels post-permission, so we let the first capture
+  // grant permission, inspect the track label, then swap if it is a virtual device.
+  try{
+    if(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia&&!navigator.mediaDevices.__rbiRealMedia){
+      var _gum=navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+      var _VIRT=/blackhole|virtual|aggregate|soundflower|loopback|obs|snap|camtwist|manycam|teams audio/i;
+      var _pickReal=function(kind){
+        return navigator.mediaDevices.enumerateDevices().then(function(ds){
+          var ins=ds.filter(function(d){return d.kind===kind;});
+          return ins.find(function(d){return /built-in|macbook|internal|facetime/i.test(d.label);})
+              || ins.find(function(d){return d.deviceId!=="default"&&d.deviceId!=="communications"&&d.label&&!_VIRT.test(d.label);})
+              || null;
+        }).catch(function(){return null;});
+      };
+      navigator.mediaDevices.getUserMedia=function(c){
+        if(!(c&&(c.audio||c.video)))return _gum(c);
+        return _gum(c).then(function(st){
+          var at=st.getAudioTracks()[0], vt=st.getVideoTracks()[0];
+          var aBad=!!(c.audio&&at&&_VIRT.test(at.label||""));
+          var vBad=!!(c.video&&vt&&_VIRT.test(vt.label||""));
+          if(!aBad&&!vBad)return st;
+          return Promise.all([aBad?_pickReal("audioinput"):null, vBad?_pickReal("videoinput"):null]).then(function(r){
+            var ra=r[0], rv=r[1];
+            if(!ra&&!rv)return st;
+            var nc=Object.assign({},c);
+            if(ra){nc.audio=(typeof c.audio==="object")?Object.assign({},c.audio):{};nc.audio.deviceId={exact:ra.deviceId};}
+            if(rv){nc.video=(typeof c.video==="object")?Object.assign({},c.video):{};nc.video.deviceId={exact:rv.deviceId};}
+            st.getTracks().forEach(function(t){t.stop();});
+            return _gum(nc);
+          });
+        });
+      };
+      navigator.mediaDevices.__rbiRealMedia=true;
+    }
+  }catch(e){}
+  // CLEAN CONSOLE: drop neko's noisy [NEKO] DBG logs + the early RTCDataChannel race
+  // errors (mouse moves before the data channel opens — harmless, stops after connect).
+  try{var _re=/\[NEKO\]|RTCDataChannel|InvalidStateError|readyState|sendData/;var _drop=function(a){try{var s="";for(var i=0;i<a.length;i++){s+=" "+(a[i]!=null?a[i]:"");}return _re.test(s);}catch(e){return false;}};["log","debug","info","warn","error","trace"].forEach(function(m){var o=console[m]?console[m].bind(console):function(){};console[m]=function(){try{if(_drop(arguments))return;}catch(_){}o.apply(null,arguments);};});}catch(e){}
+  try{if(navigator.clipboard){navigator.clipboard.read=function(){return Promise.resolve([]);};navigator.clipboard.readText=function(){return Promise.resolve("");};}}catch(e){}
+  try{var u=new URL(location.href);if(!u.searchParams.get("pwd")){u.searchParams.set("usr","rbi");u.searchParams.set("pwd","admin");history.replaceState(null,"",u.href);}}catch(e){}
+  try{
+    function tick(){
+      var t=window.__rbi_title;if(!t){t=new URL(location.href).searchParams.get("rbi_title");}
+      var f=window.__rbi_fav;if(!f){f=new URL(location.href).searchParams.get("rbi_fav");}
+      if(t){if(document.title!==t){document.title=t;}}
+      if(f){var cur=document.querySelector("link[rel*=icon]");if(cur){if(cur.href!==f){cur.href=f;}}else{var l=document.createElement("link");l.rel="icon";l.href=f;document.head.appendChild(l);}}
+      // Fill the ENTIRE window (no 16:9 letterbox border). The video stretches to
+      // the full viewport (object-fit:fill) and neko's input textarea covers the SAME
+      // full-window box, so neko maps clicks proportionally to the remote screen —
+      // mouse stays correct, and there are no black bars around the content.
+      var box="position:fixed!important;left:0!important;top:0!important;width:100vw!important;height:100vh!important;";
+      var v=document.querySelector("video");
+      if(v){v.style.cssText=box+"object-fit:fill!important;z-index:1!important;background:#000!important;cursor:default!important;pointer-events:none!important";if(v.paused){if(!__interacted){v.muted=true;}var pr=v.play();if(pr){if(pr.catch){pr.catch(function(){});}}}if(__interacted){v.muted=false;v.volume=1;}}
+      var ot=document.querySelector("textarea.overlay")||document.querySelector(".overlay");
+      if(ot){ot.style.cssText=box+"background:transparent!important;border:0!important;outline:none!important;resize:none!important;z-index:3!important;pointer-events:auto!important;cursor:default!important;visibility:visible!important";}
+    }
+    // Unmute on ANY user interaction (not once: the first click may land before the
+    // <video> exists; firing every time guarantees audio turns on once it's there).
+    var __interacted=false, __micWarmed=false;
+    // MIC = WARM (always-on after first interaction). Voice search / quick mic uses can't
+    // tolerate the on-demand spin-up, so we turn neko's mic on once (the user's choice:
+    // accept the always-on trade-off for the mic). Camera stays strictly on-demand below.
+    function warmMic(){ if(__micWarmed)return; var m=document.querySelector(".controls i[class*='fa-microphone']"); if(m){__micWarmed=true; var li=m.closest("li")||m; try{li.click();}catch(e){} try{m.click();}catch(e){}} }
+    function unmute(){__interacted=true;var v=document.querySelector("video");if(v){v.muted=false;v.volume=1;} warmMic();}
+    document.addEventListener("click",unmute);
+    document.addEventListener("keydown",unmute);
+    document.addEventListener("pointerdown",unmute);
+    // ON-DEMAND MEDIA — driven by the in-container extension over the relay /control
+    // channel. The extension reports the isolated app's ACTUAL camera/mic usage (start,
+    // stop, and software mute via track.enabled polling); we turn the user's REAL device
+    // on/off to match — so camera/mic are live ONLY while the app uses them, exactly like
+    // a normal browser. No auto-on, no toggle, no call-site guessing.
+    var __camStream=null, __camWS=null, __camTimer=null, __camPendingStop=false, __camStarting=false;
+    function camStart(){
+      if(__camStream||__camTimer||__camStarting)return;   // guard set BEFORE the async
+      var url=window.__rbi_cam; if(!url)return;            // getUserMedia, so two quick
+      __camStarting=true; __camPendingStop=false;          // cam-on signals can't both
+      navigator.mediaDevices.getUserMedia({video:{width:640,height:480,frameRate:15},audio:false}).then(function(stream){
+        __camStarting=false;
+        if(__camPendingStop){stream.getTracks().forEach(function(t){t.stop();});return;}
+        __camStream=stream;
+        var vv=document.createElement("video"); vv.srcObject=stream; vv.muted=true; vv.playsInline=true; var pr=vv.play(); if(pr&&pr.catch)pr.catch(function(){});
+        var c=document.createElement("canvas"); c.width=640; c.height=480; var cx=c.getContext("2d");
+        __camWS=new WebSocket(url); __camWS.binaryType="arraybuffer";
+        __camWS.onopen=function(){ __camTimer=setInterval(function(){ if(!__camWS||__camWS.readyState!==1||!vv.videoWidth)return; try{cx.drawImage(vv,0,0,640,480); c.toBlob(function(b){ if(b&&__camWS&&__camWS.readyState===1){ b.arrayBuffer().then(function(a){try{__camWS.send(a);}catch(_){}}); } },"image/jpeg",0.55);}catch(_){}}, 50); };
+      }).catch(function(){__camStarting=false;});
+    }
+    function camStop(){
+      __camPendingStop=true;
+      if(__camTimer){clearInterval(__camTimer);__camTimer=null;}
+      if(__camWS){try{__camWS.close();}catch(_){}__camWS=null;}
+      if(__camStream){__camStream.getTracks().forEach(function(t){t.stop();});__camStream=null;}
+    }
+    // neko's hidden mic toggle: <i class="fa-microphone-slash"> = OFF, "fa-microphone" = ON.
+    // Clicking only the opposite-state element makes this idempotent.
+    function micSet(on){ var el=document.querySelector(on?".controls .fa-microphone-slash":".controls .fa-microphone"); if(el){try{el.click();}catch(_){}} }
+    function controlConnect(){
+      var base=window.__rbi_cam; if(!base){setTimeout(controlConnect,3000);return;}
+      var url=base.replace(/\/ws(\?.*)?$/,"/control")+"?role=sub";
+      var ws; try{ws=new WebSocket(url);}catch(e){setTimeout(controlConnect,3000);return;}
+      ws.onmessage=function(ev){ try{var m=JSON.parse(ev.data); if(m.kind==="cam"){m.on?camStart():camStop();} }catch(_){} };  // mic is warm; only camera is on-demand
+      ws.onclose=function(){setTimeout(controlConnect,3000);};
+      ws.onerror=function(){try{ws.close();}catch(_){}};
+    }
+    controlConnect();
+    window.addEventListener("pagehide",function(){try{camStop();}catch(_){}});
+    // SCROLL FIX: Mac momentum / high-precision wheel events scroll WAY too fast in
+    // the remote session (neko forwards the raw, large deltaY). Intercept each wheel
+    // event and re-dispatch it scaled DOWN so neko sends a smaller scroll. The __rbi
+    // flag lets our synthetic event pass through to neko's handler.
+    try{
+      var RBI_SCROLL=0.40; // 40% of the native scroll speed
+      window.addEventListener("wheel",function(e){
+        if(e.__rbi)return;
+        e.preventDefault();e.stopImmediatePropagation();
+        var ne=new WheelEvent("wheel",{deltaX:e.deltaX*RBI_SCROLL,deltaY:e.deltaY*RBI_SCROLL,deltaZ:e.deltaZ,deltaMode:e.deltaMode,clientX:e.clientX,clientY:e.clientY,bubbles:true,cancelable:true,view:window});
+        ne.__rbi=true;
+        (e.target||document).dispatchEvent(ne);
+      },{capture:true,passive:false});
+    }catch(e){}
+    // Teams needs YOUR microphone. Seamless mode hides all neko controls, so for
+    // Teams sessions ONLY, reveal neko's control bar (it carries the mic toggle) so
+    // you can enable your mic + grant the browser mic permission. Other sites stay
+    // fully seamless (no controls shown).
+    function micUI(){try{var t=(window.__rbi_title||new URL(location.href).searchParams.get("rbi_title")||document.title||"");if(/teams/i.test(t)&&!window.__rbi_micui){window.__rbi_micui=1;var st=document.createElement("style");st.textContent="#glass-fence .bottom-bar,#glass-fence .bottom-bar *,#glass-fence .actions,#glass-fence .actions *,#glass-fence .action-btn,#glass-fence .action-btn *,#glass-fence .video-menu,#glass-fence .video-menu *{display:revert!important;visibility:visible!important;opacity:1!important}";document.head.appendChild(st);}}catch(e){}}
+    // REBRAND: replace any visible "neko"/"n.eko" text with "Accops HySecure Dev" and
+    // colour the branding orange (Accops). Walks text nodes; runs each tick so it also
+    // catches the login/connecting screens that render late.
+    var RBI_BRAND="Accops HySecure Dev",RBI_ORANGE="#F26522";
+    function rebrand(){try{
+      var re=/n\.?eko/gi;
+      var w=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,null,false),n;
+      while(n=w.nextNode()){if(n.nodeValue&&re.test(n.nodeValue)){n.nodeValue=n.nodeValue.replace(re,RBI_BRAND);if(n.parentElement){n.parentElement.style.setProperty("color",RBI_ORANGE,"important");}}}
+      if(re.test(document.title)){document.title=document.title.replace(re,RBI_BRAND);}
+    }catch(e){}}
+    tick();rebrand();setInterval(function(){tick();micUI();rebrand();warmMic();},1000);
+  }catch(e){}
+})();
+</script>

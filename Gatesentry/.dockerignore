@@ -1,0 +1,19 @@
+# secrets — never bake into the proxy image (mounted at runtime instead)
+config.json
+*.key.pem
+Accops_TLS_Termination.key.pem
+# build artifacts / host binaries / cruft
+bin/
+gatesentrybin
+gatesentrybin.exe
+tlsproxy.exe
+*.exe
+*.log
+log.db
+coverage.txt
+GSUpdateLog
+rbi-*.png
+*.png
+*.xwd
+.git
+.vs

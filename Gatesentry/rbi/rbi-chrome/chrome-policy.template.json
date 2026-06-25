@@ -16,6 +16,11 @@
     "ProxyBypassList": ""
   },
 
+  "AudioCaptureAllowed": true,
+  "AudioCaptureAllowedUrls": ["https://${ALLOWED_HOST}", "https://teams.microsoft.com", "https://teams.live.com", "https://*.microsoft.com", "https://*.office.com"],
+  "VideoCaptureAllowed": true,
+  "VideoCaptureAllowedUrls": ["https://${ALLOWED_HOST}", "https://teams.microsoft.com", "https://teams.live.com", "https://*.microsoft.com", "https://*.office.com"],
+
   "DeveloperToolsAvailability": 2,
   "DownloadRestrictions": 3,
   "AllowFileSelectionDialogs": false,

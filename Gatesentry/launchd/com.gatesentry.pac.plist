@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.gatesentry.pac</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>-m</string>
+    <string>http.server</string>
+    <string>8009</string>
+    <string>--bind</string>
+    <string>127.0.0.1</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/arun/.gatesentry-rbi/pac</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/rbi-pac-server.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/rbi-pac-server.log</string>
+</dict>
+</plist>

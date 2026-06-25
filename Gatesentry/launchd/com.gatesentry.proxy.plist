@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.gatesentry.proxy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/arun/Downloads/tls-termination-proxy/Gatesentry/bin/gatesentrybin</string>
+    <string>config.json</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/arun/Downloads/tls-termination-proxy/Gatesentry</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RBI_ISOLATE_HOSTS</key>
+    <string>youtube.com,teams.microsoft.com,teams.live.com,meet.google.com,webcammictest.com</string>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/gatesentry-proxy.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/gatesentry-proxy.log</string>
+</dict>
+</plist>

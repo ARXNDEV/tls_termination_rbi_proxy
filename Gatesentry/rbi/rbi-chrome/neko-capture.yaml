@@ -1,0 +1,45 @@
+
+# Appended to /etc/neko/neko.yaml by the Dockerfile. neko v3 IGNORES the V2-style
+# NEKO_CAPTURE_VIDEO_PIPELINE env (m1k1o/neko#610) and, with no pipelines defined,
+# falls back to a built-in default whose show_pointer defaults to TRUE — which bakes
+# the container cursor into the video, so the client sees a SECOND, laggy cursor on
+# top of its own local cursor. Defining the pipeline here with show_pointer:false
+# captures the screen WITHOUT the pointer, leaving only the viewer's local cursor.
+# Values are neko's documented vp8 example (proven), with cpu-used:6 for the CPU-only
+# host and fps:30.
+capture:
+  video:
+    codec: vp8
+    ids: [ main ]
+    pipelines:
+      main:
+        fps: "30"
+        gst_encoder: vp8enc
+        gst_params:
+          target-bitrate: "round(3072 * 650)"
+          cpu-used: "6"
+          end-usage: "cbr"
+          threads: "4"
+          deadline: "1"
+          undershoot: "95"
+          buffer-size: "(3072 * 4)"
+          buffer-initial-size: "(3072 * 2)"
+          buffer-optimal-size: "(3072 * 3)"
+          keyframe-max-dist: "25"
+          min-quantizer: "4"
+          max-quantizer: "20"
+        show_pointer: false
+  # MICROPHONE: neko pipes the client's mic into this PulseAudio source. The
+  # entrypoint sets it as chromium's default input so Teams/Meet auto-pick it.
+  microphone:
+    enabled: true
+    device: "audio_input"
+  # WEBCAM (camera passthrough) is enabled separately once the VM host has the
+  # v4l2loopback kernel module loaded and /dev/video0 is mounted into the container
+  # (rbi_session.go adds --device when the host device exists). Until then it stays
+  # disabled so neko starts cleanly without a /dev/video0.
+  webcam:
+    enabled: false
+    device: "/dev/video0"
+    width: 1280
+    height: 720

@@ -1,0 +1,30 @@
+# Gatesentry TLS-termination + RBI proxy, containerized.
+# Builds a static binary, then runs it on a docker-cli base so the proxy can
+# launch per-session RBI containers on the host via the mounted docker.sock.
+#
+# Run (from Gatesentry/):
+#   docker build -f Dockerfile.proxy -t gatesentry-proxy:latest .
+#   docker run -d --name gatesentry-proxy \
+#     -p 8080:8080 -p 8001:8001 \
+#     -v /var/run/docker.sock:/var/run/docker.sock \
+#     -v "$PWD/config.json:/app/config.json:ro" \
+#     -e RBI_FORWARD_HOST=host.docker.internal \
+#     -e RBI_IMAGE=rbi-chrome-neko:latest \
+#     --add-host=host.docker.internal:host-gateway \
+#     gatesentry-proxy:latest
+
+FROM golang:1.21 AS build
+WORKDIR /src
+COPY . .
+ENV CGO_ENABLED=0
+RUN go build -trimpath -o /out/gatesentrybin .
+
+FROM docker:cli
+RUN apk add --no-cache ca-certificates
+COPY --from=build /out/gatesentrybin /usr/local/bin/gatesentrybin
+# App data (filters/categories/pac/settings). config.json (CA secret) is mounted
+# at runtime via -v, NOT baked (see .dockerignore).
+COPY --from=build /src /app
+WORKDIR /app
+EXPOSE 8080 8001
+ENTRYPOINT ["gatesentrybin", "config.json"]
