@@ -567,17 +567,21 @@ func (h ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(rbiFavURL, "data:") {
 			favLink = "<link rel=\"icon\" href=\"" + rbiFavURL + "\">"
 		}
-		// Camera-relay URL for the in-tab auto-camera (inject-head.html autoCam). The
-		// relay runs on the VM host; the client reaches it at the same IP it uses for
-		// WebRTC (RBI_NAT1TO1). Empty on loopback-only setups -> autoCam stays off.
+		// MIC = native WebRTC (rbiWarmMic -> $client.enableMicrophone). CAMERA = native WebRTC
+		// (rbiWarmMedia): on first gesture, once the peer is ICE-connected + host, getUserMedia(video)
+		// -> $client._peer.addTransceiver(track,{direction:"sendonly"}) + VP8 codec pin; the neko
+		// client's onnegotiationneeded then sends signal/offer (same renegotiation path the mic
+		// uses). Stock neko v3.1.4 server routes the received video track into capture.Webcam ->
+		// v4l2sink -> /dev/video10 (verified in neko src webrtc/manager.go:377-475: Video->Webcam->
+		// appsrc.Push; NO server patch / Docker rebuild needed). This REPLACES the camrelay JPEG
+		// bridge — stop camrelay so neko's v4l2sink is the SOLE /dev/video10 writer (two writers
+		// conflict). The VP8 codec pin is critical: the earlier "native blocked" finding was a
+		// codec mismatch (client offered H264, server webcam pipeline VP8), not a server limit.
 		camURL := ""
 		if ip := os.Getenv("RBI_NAT1TO1"); ip != "" && ip != "127.0.0.1" {
 			camURL = "wss://" + ip + ":8443/ws"
 		}
-		// __rbi_cam="" DISABLES the baked (unreliable, on-demand control-channel) camStart
-		// in inject-head.html; the proxy now drives a RELIABLE warm camera (rbiWarmCamera)
-		// off __rbi_cam_url instead. Deployed via `go build` + proxy restart — no image rebuild.
-		inject := favLink + "<script>window.__rbi_title=" + qt + ";window.__rbi_fav=" + qf + ";window.__rbi_cam=\"\";window.__rbi_cam_url=" + strconv.Quote(camURL) + ";</script>" + rbiWarmCamera + "</head>"
+		inject := favLink + "<script>window.__rbi_title=" + qt + ";window.__rbi_fav=" + qf + ";window.__rbi_cam=\"\";window.__rbi_cam_url=" + strconv.Quote(camURL) + ";</script>" + rbiWarmMic + rbiWarmCameraMSTP + "</head>"
 		s := string(localCopyData)
 		s = rbiIconLinkRe.ReplaceAllString(s, "")
 		// Neko's viewer, its assets and its signaling WebSocket are all ROOT-relative.
@@ -822,13 +826,57 @@ var rbiIconLinkRe = regexp.MustCompile(`(?i)<link\b[^>]*\brel=["'][^"']*icon[^"'
 // RTCDataChannel race errors that fire before the data channel opens.
 const rbiConsoleRebrand = `<script>(function(){try{var BR="Accops HySecure Dev",OR="color:#F26522;font-weight:bold";var DROP=/RTCDataChannel|InvalidStateError|readyState|sendData/;var rep=function(x){return (typeof x==="string")?x.replace(/\[NEKO\]/g,"["+BR+"]").replace(/n\.?eko/gi,BR):x;};["log","debug","info","warn","error","trace"].forEach(function(m){var o=console[m]?console[m].bind(console):function(){};console[m]=function(){try{var s="";for(var i=0;i<arguments.length;i++){s+=" "+arguments[i];}if(DROP.test(s))return;var a=Array.prototype.slice.call(arguments);if(typeof a[0]==="string"&&a[0].indexOf("%c")<0&&/\[NEKO\]|n\.?eko/i.test(a[0])){var t=a[0].replace(/\[NEKO\]/g,"["+BR+"]").replace(/n\.?eko/gi,BR);return o.apply(null,["%c"+t,OR].concat(a.slice(1)));}for(var j=0;j<a.length;j++){a[j]=rep(a[j]);}return o.apply(null,a);}catch(_){return o.apply(null,arguments);}};});}catch(e){}})();</script>`
 
-// rbiWarmCamera is injected just before </head> (after __rbi_cam_url is set). neko v3 has no
+// rbiCapturePeer is injected at the START of <head> (before neko's deferred bundle runs) and
+// wraps window.RTCPeerConnection so the client's peer instance is captured into
+// window.__rbiPeer. rbiNativeCamera then adds a sendonly video track to that same peer.
+const rbiCapturePeer = `<script>(function(){try{if(window.__rbiPeerHook)return;window.__rbiPeerHook=1;var N=window.RTCPeerConnection||window.webkitRTCPeerConnection;if(!N)return;function W(cfg){var p=new N(cfg);try{window.__rbiPeer=p;}catch(e){}return p;}W.prototype=N.prototype;try{window.RTCPeerConnection=W;}catch(e){}try{window.webkitRTCPeerConnection=W;}catch(e){}}catch(e){}})();</script>`
+
+// rbiWarmMic is injected just before </head>. CDP-verified flow (the reliable one): the server
+// only accepts the client's mic when the session is HOST. The neko client exposes its accessor at
+// window.$client.$accessor (NOT window.$accessor), and $accessor.remote.request() SELF-GRANTS host
+// under implicit_hosting (confirmed: controlling -> true, server 'session host changed has_host=true').
+// So the warm polls: if not already active (_micActive), it requests control until host, then calls
+// $client.enableMicrophone() directly — which adds the user's REAL mic track ("MacBook Pro
+// Microphone (Built-in)") and the server builds the microphone pipeline -> Pulse audio_input. Fully
+// automatic (no user interaction needed; --use-fake-ui auto-grants getUserMedia). Works on every
+// isolated site (youtube voice search, teams, meet). _micActive is the latch so it stops once on.
+const rbiWarmMic = `<script>(function(){try{function go(){var c=window.$client;if(!c||!c.connected||c._micActive)return;try{var r=c.$accessor&&c.$accessor.remote;if(r&&!r.controlling){if(r.request)r.request();return;}}catch(e){}try{c.enableMicrophone();}catch(e){}}var n=0;var iv=setInterval(function(){n++;var c=window.$client;if((c&&c._micActive)||n>200){clearInterval(iv);return;}go();},700);["click","keydown","pointerdown","touchstart"].forEach(function(ev){document.addEventListener(ev,go,{passive:true});});}catch(e){}})();</script>`
+
+// rbiWarmMedia is injected just before </head> — CAMERA only. (The MIC is warmed by the baked
+// inject-head.html warmMic DOM-click, restored via Dockerfile.fix; doing the mic here too would
+// fight that button and toggle the mic off.) On the first gesture for a camera-relevant host,
+// once the captured peer (window.__rbiPeer) is connected AND the user is host (requests control
+// first), it grabs the real camera and adds a sendonly VP8 video track to the SAME peer; the
+// client's own onnegotiationneeded sends the native offer -> server OnTrack -> capture.Webcam ->
+// v4l2sink /dev/video10. Retries until added.
+const rbiWarmMedia = `<script>(function(){try{var isCam=/teams|meet\.google|webcam|zoom|webex|whereby|skype|jitsi/i.test(location.hostname);if(!isCam)return;var done=false;function ready(pc){return !!pc&&(pc.iceConnectionState==="connected"||pc.iceConnectionState==="completed"||pc.connectionState==="connected");}function go(){if(done)return;var c=window.$client;var pc=c&&c._peer;if(!ready(pc))return;done=true;try{var r=c.$accessor&&c.$accessor.remote;if(r&&!r.controlling&&r.request)r.request();}catch(e){}navigator.mediaDevices.getUserMedia({video:{width:{ideal:1280},height:{ideal:720},frameRate:{ideal:30}},audio:false}).then(function(s){window.__rbiCamStream=s;var v=document.createElement("video");v.srcObject=s;v.muted=true;v.autoplay=true;v.playsInline=true;v.setAttribute("style","position:fixed;right:10px;bottom:10px;width:160px;height:120px;border:2px solid #F26522;border-radius:8px;z-index:2147483647;background:#000;transform:scaleX(-1)");document.body.appendChild(v);v.play().catch(function(){});var trk=s.getVideoTracks()[0];var tx=pc.addTransceiver(trk,{direction:"sendonly",streams:[s]});try{var caps=RTCRtpSender.getCapabilities("video");if(caps&&tx.setCodecPreferences){var vp8=caps.codecs.filter(function(c){return /vp8/i.test(c.mimeType);});if(vp8.length)tx.setCodecPreferences(vp8.concat(caps.codecs.filter(function(c){return !/vp8/i.test(c.mimeType);})));}}catch(e){}try{var sp=tx.sender.getParameters();if(!sp.encodings||!sp.encodings.length){sp.encodings=[{}];}sp.encodings[0].maxBitrate=3000000;sp.encodings[0].maxFramerate=30;sp.degradationPreference="maintain-framerate";tx.sender.setParameters(sp);}catch(e){}}).catch(function(e){done=false;});}["click","keydown","pointerdown","touchstart"].forEach(function(ev){document.addEventListener(ev,go,{passive:true});});}catch(e){}})();</script>`
+
+// rbiWarmCamera (UNUSED fallback) streams JPEG frames over wss to the camrelay /ws. Kept as a
+// fallback; the native path above (rbiNativeCamera) is preferred. neko v3 has no
 // client webcam send-path, so on camera-relevant sites we capture the user's REAL camera
 // (preferring a non-virtual device), with an 8s getUserMedia timeout + retry, and stream JPEG
 // frames over wss to the camrelay /ws (which feeds /dev/video10 in the container). It is WARM:
 // it fires on the FIRST user gesture (like the always-reliable mic) instead of the fragile
 // on-demand control channel, and the WS auto-reconnects. This is what makes the camera reliable.
-const rbiWarmCamera = `<script>(function(){try{var U=window.__rbi_cam_url||"";if(!U)return;if(!/teams|meet\.google|webcam|zoom|webex|whereby|skype|jitsi/i.test(location.hostname))return;var started=false;function pick(){return navigator.mediaDevices.enumerateDevices().then(function(ds){var vs=ds.filter(function(d){return d.kind==="videoinput";});var r=vs.find(function(d){return /facetime|built-in|macbook|internal/i.test(d.label);})||vs.find(function(d){return d.label&&!/obs|virtual|snap|manycam|loopback/i.test(d.label);});return r?r.deviceId:null;}).catch(function(){return null;});}function go(){if(started)return;started=true;pick().then(function(id){var c={video:{width:640,height:480,frameRate:15}};if(id)c.video.deviceId={ideal:id};var to=new Promise(function(_,r){setTimeout(function(){r(new Error("to"));},8000);});Promise.race([navigator.mediaDevices.getUserMedia(c),to]).then(function(s){var cv=document.createElement("canvas");cv.width=640;cv.height=480;var x=cv.getContext("2d");var hf=false;var trk=s.getVideoTracks()[0];function vidFallback(){var v=document.createElement("video");v.srcObject=s;v.muted=true;v.playsInline=true;v.autoplay=true;v.setAttribute("style","position:fixed;left:0;top:0;width:64px;height:48px;opacity:0.02;pointer-events:none;z-index:-1");document.body.appendChild(v);v.play().catch(function(){});setInterval(function(){if(v.videoWidth){try{x.drawImage(v,0,0,640,480);hf=true;}catch(_){}}},66);}if(window.MediaStreamTrackProcessor){try{var rd=new MediaStreamTrackProcessor({track:trk}).readable.getReader();(function pump(){rd.read().then(function(r){if(r.done)return;try{x.drawImage(r.value,0,0,640,480);hf=true;}catch(_){}try{r.value.close();}catch(_){}pump();}).catch(function(){});})();}catch(e){vidFallback();}}else{vidFallback();}function conn(){var ws;try{ws=new WebSocket(U);}catch(e){setTimeout(conn,1500);return;}ws.binaryType="arraybuffer";var t=null;ws.onopen=function(){t=setInterval(function(){if(ws.readyState!==1||!hf)return;try{cv.toBlob(function(b){if(b)b.arrayBuffer().then(function(a){try{ws.send(a);}catch(_){}});},"image/jpeg",0.6);}catch(_){}},66);};ws.onclose=function(){if(t){clearInterval(t);t=null;}setTimeout(conn,1500);};ws.onerror=function(){try{ws.close();}catch(_){}};}conn();}).catch(function(){started=false;setTimeout(go,3000);});});}["click","keydown","pointerdown"].forEach(function(e){document.addEventListener(e,go);});}catch(e){}})();</script>`
+// Capture from a SMALL but VISIBLE self-view PiP (bottom-right, like a video-call self
+// view). The previous version captured from a HIDDEN/8x6 video (or ImageCapture) — Chrome/
+// Brave THROTTLE a hidden/occluded getUserMedia sink to BLACK frames (confirmed: LIGHTING 10
+// at 16fps = black). A visible, rendered <video> gets REAL frames (same as the :8443 Camera
+// Bridge, which always worked because its video was visible). drawImage -> JPEG -> camrelay
+// /ws -> /dev/video10. WS auto-reconnects. So: open the isolated site, click once, a small
+// self-view appears bottom-right and the SAME face streams as the container's RBI Camera.
+const rbiWarmCamera = `<script>(function(){try{var U=window.__rbi_cam_url||"";if(!U)return;if(!/teams|meet\.google|webcam|zoom|webex|whereby|skype|jitsi/i.test(location.hostname))return;var started=false,ws=null,stream=null;function connect(){if(!stream)return;try{ws=new WebSocket(U);}catch(e){setTimeout(connect,1500);return;}ws.binaryType="arraybuffer";ws.onclose=function(){ws=null;if(stream)setTimeout(connect,1500);};ws.onerror=function(){try{ws.close();}catch(_){}};}function go(){if(started)return;started=true;navigator.mediaDevices.getUserMedia({video:{width:640,height:480,frameRate:30}}).then(function(s){stream=s;var v=document.createElement("video");v.srcObject=s;v.muted=true;v.autoplay=true;v.playsInline=true;v.setAttribute("style","position:fixed;right:10px;bottom:10px;width:160px;height:120px;border:2px solid #F26522;border-radius:8px;z-index:2147483647;background:#000;transform:scaleX(-1)");document.body.appendChild(v);v.play().catch(function(){});var cv=document.createElement("canvas");cv.width=640;cv.height=480;var x=cv.getContext("2d");setInterval(function(){if(!ws||ws.readyState!==1||!v.videoWidth)return;try{x.drawImage(v,0,0,640,480);cv.toBlob(function(b){if(b&&ws&&ws.readyState===1)b.arrayBuffer().then(function(a){try{ws.send(a);}catch(_){}});},"image/jpeg",0.6);}catch(_){}},33);connect();}).catch(function(){started=false;});}["click","keydown","pointerdown","touchstart"].forEach(function(e){document.addEventListener(e,go,{passive:true});});}catch(e){}})();</script>`
+
+// rbiWarmCameraMSTP is the BEST-QUALITY camera path: JPEG-over-WebSocket to camrelay
+// (which feeds /dev/video10 via ffmpeg). It beats native WebRTC, whose upstream path this
+// network throttles to ~1fps; camrelay has no congestion control so it sustains ~25fps.
+// IMPORTANT: it renders a SMALL (96x72) visible self-view and captures frames from it via
+// drawImage. The visible element is mandatory — Brave/Chrome throttle a hidden/occluded
+// getUserMedia sink to BLACK frames (verified: LIGHTING 10 at 27fps with a hidden sink).
+// Reading the track headlessly (MediaStreamTrackProcessor) still yields black because the
+// SOURCE is throttled, so a tiny visible thumbnail is the minimum that keeps it live.
+// Fires on first user gesture; the WS auto-reconnects.
+const rbiWarmCameraMSTP = `<script>(function(){try{var U=window.__rbi_cam_url||"";if(!U)return;if(!/teams|meet\.google|webcam|zoom|webex|whereby|skype|jitsi/i.test(location.hostname))return;var started=false,ws=null,stream=null;function connect(){if(!stream)return;try{ws=new WebSocket(U);}catch(e){setTimeout(connect,1500);return;}ws.binaryType="arraybuffer";ws.onclose=function(){ws=null;if(stream)setTimeout(connect,1500);};ws.onerror=function(){try{ws.close();}catch(_){}};}function go(){if(started)return;started=true;navigator.mediaDevices.getUserMedia({video:{width:{ideal:640},height:{ideal:480},frameRate:{ideal:30}},audio:false}).then(function(s){stream=s;var v=document.createElement("video");v.srcObject=s;v.muted=true;v.autoplay=true;v.playsInline=true;v.setAttribute("style","position:fixed;right:6px;bottom:6px;width:96px;height:72px;border-radius:6px;z-index:2147483647;background:#000;transform:scaleX(-1);opacity:0.02;pointer-events:none");document.body.appendChild(v);v.play().catch(function(){});var cv=document.createElement("canvas");cv.width=640;cv.height=480;var x=cv.getContext("2d");setInterval(function(){if(!ws||ws.readyState!==1||!v.videoWidth)return;try{x.drawImage(v,0,0,640,480);cv.toBlob(function(b){if(b&&ws&&ws.readyState===1)b.arrayBuffer().then(function(a){try{ws.send(a);}catch(_){}});},"image/jpeg",0.6);}catch(_){}},40);connect();}).catch(function(){started=false;});}["click","keydown","pointerdown","touchstart"].forEach(function(e){document.addEventListener(e,go,{passive:true});});}catch(e){}})();</script>`
 
 // NOTE: webcam passthrough was tested and is NOT achievable with neko v3's stock
 // client — it has a mic toggle but no webcam control and only forwards the audio

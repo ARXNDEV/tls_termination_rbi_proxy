@@ -7,6 +7,7 @@ package gatesentryproxy
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"html"
 	"log"
@@ -26,6 +27,13 @@ type rbiSession struct {
 	tcpPort, udpPort int
 	created          time.Time
 	lastActive       time.Time
+
+	// viewers counts live viewer WebSocket connections (neko signaling channels)
+	// for this session. The container's life is tied to it: when the last viewer
+	// disconnects (tab closed/reloaded/crashed) the container is torn down after a
+	// short grace window. teardownTimer is the pending grace timer, if any.
+	viewers       int
+	teardownTimer *time.Timer
 }
 
 var (
@@ -148,27 +156,116 @@ func rbiImage() string   { return rbiEnv("RBI_IMAGE", "rbi-chrome-neko:latest") 
 func rbiDeviceExists(path string) bool { _, err := os.Stat(path); return err == nil }
 
 // rbiVideoPipeline returns the GStreamer pipeline neko uses to encode the screen.
-// neko's auto-default is only ~2 Mbps VP8 @25fps, which looks blocky at 1080p. The
-// container encodes natively (arm64) with CPU to spare, and media flows over loopback
-// (NAT1TO1=127.0.0.1, no bandwidth limit), so we raise bitrate + fps + quality preset
-// substantially. Tunable without a rebuild via env:
-//   RBI_VIDEO_BITRATE  (bits/s, default 8000000 = 8 Mbps)
-//   RBI_VIDEO_FPS      (frames/s, default 30 — also sets the X display refresh)
-//   RBI_VIDEO_CPU_USED (vp8 speed/quality, 0=best..16=fastest, default 2)
-// Mirrors neko's default pipeline structure (named elements: framerate/encoder/appsink)
-// so neko's syntax check passes; only the tunables differ.
+// SOFTWARE ENCODE ONLY (no GPU): the container has CPU to spare and media flows
+// over loopback (NAT1TO1=127.0.0.1, no bandwidth limit), so we raise bitrate/fps/
+// quality well above neko's blocky ~2 Mbps VP8 @25fps default.
+//
+// Codec is selectable via RBI_VIDEO_CODEC (default vp8):
+//
+//	vp8  (default) — libvpx realtime. Most pion-reliable, proven on this stack.
+//	h264 / x264    — x264 tune=zerolatency. Best quality-per-bit + lowest latency
+//	                 for screen content on CPU; this is the spec's primary codec.
+//	                 Opt-in because it needs the client to negotiate H264.
+//	vp9            — better quality/bit than VP8 but pricier in software.
+//
+// Common front-end for all codecs: a leaky queue caps latency to ~1 frame — if the
+// encoder can't keep up we DROP the stale frame rather than grow a backlog (smooth
+// pacing over resolution, per the perf targets).
+//
+// Tunables (no rebuild):
+//   RBI_VIDEO_BITRATE  bits/s, default 8000000 (8 Mbps)
+//   RBI_VIDEO_FPS      frames/s, default 30 (also sets the X display refresh)
+//   RBI_VIDEO_CPU_USED vpx speed/quality 0=best..16=fastest (vp8 default 2, vp9 8)
+//   RBI_X264_PRESET    x264 speed-preset, default veryfast (downshift: superfast/ultrafast)
+// rbiVideoCodec normalizes RBI_VIDEO_CODEC to the codec name neko expects
+// (vp8/vp9/h264). Keep this in sync with the switch in rbiVideoPipeline.
+func rbiVideoCodec() string {
+	switch strings.ToLower(strings.TrimSpace(rbiEnv("RBI_VIDEO_CODEC", "vp8"))) {
+	case "h264", "x264":
+		return "h264"
+	case "vp9":
+		return "vp9"
+	default:
+		return "vp8"
+	}
+}
+
 func rbiVideoPipeline() string {
+	codec := strings.ToLower(strings.TrimSpace(rbiEnv("RBI_VIDEO_CODEC", "vp8")))
 	br := rbiEnv("RBI_VIDEO_BITRATE", "8000000")
 	fps := rbiEnv("RBI_VIDEO_FPS", "30")
-	cpu := rbiEnv("RBI_VIDEO_CPU_USED", "2")
-	return "ximagesrc display-name=:99.0 show-pointer=false use-damage=false" +
+
+	// leaky=downstream + small max-buffers: always encode the FRESHEST frame; never
+	// queue a backlog that would show up as rubber-band lag. {display} is substituted
+	// by neko with the container's X display when this is fed via capture.video.pipelines.
+	src := "ximagesrc display-name={display} show-pointer=false use-damage=false" +
 		" ! capsfilter caps=video/x-raw,framerate=" + fps + "/1 name=framerate" +
-		" ! videoconvert ! queue" +
-		" ! vp8enc name=encoder target-bitrate=" + br + " end-usage=cbr threads=8 deadline=1" +
-		" buffer-size=12288 keyframe-max-dist=30 cpu-used=" + cpu +
-		" undershoot=95 buffer-initial-size=6144 buffer-optimal-size=9216" +
-		" min-quantizer=2 max-quantizer=20" +
-		" ! appsink name=appsink"
+		" ! videoconvert ! queue leaky=downstream max-buffers=2"
+
+	switch codec {
+	case "h264", "x264":
+		// CBR + capped keyframe interval (~2s); zerolatency disables B-frames and
+		// lookahead so every frame ships immediately. bitrate is in kbps.
+		return src +
+			" ! x264enc name=encoder tune=zerolatency speed-preset=" + rbiEnv("RBI_X264_PRESET", "veryfast") +
+			" bitrate=" + rbiBitsToKbps(br) + " pass=cbr key-int-max=" + rbiKeyInt(fps) +
+			" bframes=0 sliced-threads=true threads=8 aud=true" +
+			" ! video/x-h264,stream-format=byte-stream,profile=constrained-baseline" +
+			" ! appsink name=appsink"
+	case "vp9":
+		return src +
+			" ! vp9enc name=encoder target-bitrate=" + br + " end-usage=cbr deadline=1" +
+			" cpu-used=" + rbiEnv("RBI_VIDEO_CPU_USED", "8") + " threads=8 tile-columns=2 row-mt=true" +
+			" keyframe-max-dist=" + rbiKeyInt(fps) + " min-quantizer=2 max-quantizer=24" +
+			" ! appsink name=appsink"
+	default: // vp8
+		return src +
+			" ! vp8enc name=encoder target-bitrate=" + br + " end-usage=cbr threads=8 deadline=1" +
+			" buffer-size=12288 keyframe-max-dist=30 cpu-used=" + rbiEnv("RBI_VIDEO_CPU_USED", "2") +
+			" undershoot=95 buffer-initial-size=6144 buffer-optimal-size=9216" +
+			" min-quantizer=2 max-quantizer=20" +
+			" ! appsink name=appsink"
+	}
+}
+
+// rbiVideoPipelinesJSON wraps rbiVideoPipeline() as the JSON that neko's
+// capture.video.pipelines (plural) flag expects — fed via NEKO_CAPTURE_VIDEO_PIPELINES.
+//
+// IMPORTANT: this is the override that ACTUALLY applies. neko ignores the singular
+// capture.video.pipeline whenever pipelines is set, and the rbi-chrome image's
+// neko-capture.yaml sets pipelines — so the old singular env was a silent no-op
+// (the container ran the yaml's 2 Mbps/cpu-used=6 VP8). The plural flag (env/flag)
+// overrides the config file in viper, so this restores real, no-rebuild control.
+//
+// The JSON is decoded by json.Unmarshal straight into neko's VideoConfig, which has
+// NO json tags — so keys MUST be Go field names (GstPipeline/ShowPointer), NOT the
+// yaml's snake_case. The pipeline id "main" matches neko-capture.yaml's ids: [main].
+func rbiVideoPipelinesJSON() string {
+	type vcfg struct {
+		GstPipeline string `json:"GstPipeline"`
+		ShowPointer bool   `json:"ShowPointer"`
+	}
+	b, err := json.Marshal(map[string]vcfg{"main": {GstPipeline: rbiVideoPipeline(), ShowPointer: false}})
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
+}
+
+// rbiBitsToKbps converts a bits/s string to kbps (x264enc's bitrate unit).
+func rbiBitsToKbps(bits string) string {
+	if n, err := strconv.Atoi(strings.TrimSpace(bits)); err == nil && n > 0 {
+		return strconv.Itoa(n / 1000)
+	}
+	return "8000"
+}
+
+// rbiKeyInt returns a ~2-second keyframe interval (in frames) for the given fps.
+func rbiKeyInt(fps string) string {
+	if n, err := strconv.Atoi(strings.TrimSpace(fps)); err == nil && n > 0 {
+		return strconv.Itoa(n * 2)
+	}
+	return "60"
 }
 func rbiIdleTTL() time.Duration {
 	if n, err := strconv.Atoi(rbiEnv("RBI_IDLE_SECONDS", "600")); err == nil && n > 0 {
@@ -188,6 +285,13 @@ func rbiLaunchSession(rawURL string) (*rbiSession, error) {
 	defer lm.Unlock()
 	rbiMu.Lock()
 	if s, ok := rbiSessionsByHost[host]; ok && rbiContainerRunning(s.name) {
+		// Reusing a still-running container (e.g. tab reopened within the close
+		// grace, or a concurrent asset request): cancel any pending teardown so the
+		// grace timer doesn't kill a session that's coming back to life.
+		if s.teardownTimer != nil {
+			s.teardownTimer.Stop()
+			s.teardownTimer = nil
+		}
 		s.lastActive = time.Now()
 		rbiMu.Unlock()
 		return s, nil
@@ -231,16 +335,33 @@ func rbiLaunchSession(rawURL string) (*rbiSession, error) {
 		"-e", "TURN_HOST=" + rbiEnv("RBI_TURN_HOST", "dummy"),
 		"-e", "TURN_PORT=" + rbiEnv("RBI_TURN_PORT", "3478"),
 		"-e", "NEKO_DESKTOP_SCREEN=" + rbiEnv("RBI_VIDEO_RESOLUTION", "1920x1080") + "@" + rbiEnv("RBI_VIDEO_FPS", "30"),
-		// HIGH-QUALITY stream: override neko's ~2 Mbps/25fps default VP8 pipeline.
-		"-e", "NEKO_CAPTURE_VIDEO_PIPELINE=" + rbiVideoPipeline(),
 		"-e", "NEKO_MEMBER_PROVIDER=multiuser",
 		"-e", "NEKO_MEMBER_MULTIUSER_USER_PASSWORD=user",
 		"-e", "NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD=admin",
 		"-e", "NEKO_SESSION_IMPLICIT_HOSTING=true",
 		"-e", "NEKO_WEBRTC_ICELITE=1",
 		"-e", "NEKO_WEBRTC_NAT1TO1=" + rbiEnv("RBI_NAT1TO1", "127.0.0.1"),
-		"-e", "NEKO_WEBRTC_UDPMUX=" + strconv.Itoa(udpPort),
+		// TCP-ONLY WebRTC: the corporate network THROTTLES UDP (mic works, but the camera's
+		// upstream video chokes to ~1fps over UDP). UDP still *connects*, so the client won't
+		// fall back to TCP on its own. Dropping UDPMUX forces all WebRTC media (screen+mic+
+		// camera) onto the un-throttled TCP mux → native camera gets full fps. Set
+		// RBI_WEBRTC_ALLOW_UDP=1 to restore UDP (lower latency) on networks that don't throttle.
 		"-e", "NEKO_WEBRTC_TCPMUX=" + strconv.Itoa(tcpMuxPort),
+	}
+	if rbiEnv("RBI_WEBRTC_ALLOW_UDP", "0") == "1" {
+		args = append(args, "-e", "NEKO_WEBRTC_UDPMUX="+strconv.Itoa(udpPort))
+	}
+	// HIGH-QUALITY stream override is OPT-IN. The deployed neko's pipelines-JSON
+	// schema must be confirmed on a throwaway container first — a mismatched schema
+	// yields an empty encoder (`! name=encoder`) → GStreamer syntax error → black
+	// stream. Default OFF = neko uses its built-in neko-capture.yaml (proven VP8).
+	// Enable with RBI_VIDEO_PIPELINE_OVERRIDE=1 once the format is verified, then
+	// tune via RBI_VIDEO_CODEC / RBI_VIDEO_BITRATE / RBI_VIDEO_FPS / RBI_VIDEO_CPU_USED.
+	if rbiEnv("RBI_VIDEO_PIPELINE_OVERRIDE", "0") == "1" {
+		args = append(args,
+			"-e", "NEKO_CAPTURE_VIDEO_CODEC="+rbiVideoCodec(),
+			"-e", "NEKO_CAPTURE_VIDEO_PIPELINES="+rbiVideoPipelinesJSON(),
+		)
 	}
 	// Webcam passthrough: if the host has a v4l2loopback device, mount it and enable
 	// neko's webcam capture so the isolated Chrome can use the client's camera (neko
@@ -281,6 +402,10 @@ func rbiLaunchSession(rawURL string) (*rbiSession, error) {
 		return nil, fmt.Errorf("session %s not ready: %w", id, err)
 	}
 	log.Printf("[rbi] launched per-session %s for %s (viewer :%d, webrtc udp :%d)", name, rawURL, tcpPort, udpPort)
+
+	// Apply post-launch tuning (page zoom for all sites; blocklist relax for
+	// multi-domain sites like Meet/Teams), then one Chrome reload.
+	rbiTuneContainer(name, host)
 
 	rbiMu.Lock()
 	rbiSessionsByHost[host] = s
@@ -373,6 +498,148 @@ func rbiContainerRunning(name string) bool {
 	return err == nil && len(out) >= 4 && string(out[:4]) == "true"
 }
 
+// rbiCloseGrace is how long after the LAST viewer disconnects we wait before
+// destroying the container. A small grace (default 2s) tolerates page reloads
+// and brief WS reconnects without a cold-start respawn, while still feeling
+// immediate to the user. Set RBI_CLOSE_GRACE_MS=0 for instant teardown.
+func rbiCloseGrace() time.Duration {
+	if v := strings.TrimSpace(rbiEnv("RBI_CLOSE_GRACE_MS", "")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return time.Duration(n) * time.Millisecond
+		}
+	}
+	return 2 * time.Second
+}
+
+// rbiViewerAttach registers a live viewer WebSocket for the session bound to the
+// given container (viewer) port, and cancels any pending teardown — the tab is
+// (back) open. Returns the session, or nil if the port isn't an RBI session
+// (so non-RBI websockets are a no-op). LIFECYCLE-CRITICAL.
+func rbiViewerAttach(port int) *rbiSession {
+	rbiMu.Lock()
+	defer rbiMu.Unlock()
+	for _, s := range rbiSessionsByHost {
+		if s.tcpPort == port {
+			if s.teardownTimer != nil {
+				s.teardownTimer.Stop()
+				s.teardownTimer = nil
+			}
+			s.viewers++
+			s.lastActive = time.Now()
+			return s
+		}
+	}
+	return nil
+}
+
+// rbiViewerDetach drops a viewer WebSocket. When the LAST viewer for the session
+// leaves, the container is torn down after rbiCloseGrace(). This is the immediate
+// per-tab teardown path: closing the tab drops neko's signaling WS, which unwinds
+// HandleWebsocketConnection and lands here, so the container — and the camera/mic
+// it was holding — is destroyed promptly. The GC reaper is only a backstop.
+// LIFECYCLE-CRITICAL.
+func rbiViewerDetach(port int) {
+	rbiMu.Lock()
+	defer rbiMu.Unlock()
+	var host string
+	var s *rbiSession
+	for h, x := range rbiSessionsByHost {
+		if x.tcpPort == port {
+			host, s = h, x
+			break
+		}
+	}
+	if s == nil {
+		return
+	}
+	if s.viewers > 0 {
+		s.viewers--
+	}
+	if s.viewers > 0 {
+		return // other tabs/viewers still attached to this container
+	}
+
+	name := s.name
+	grace := rbiCloseGrace()
+	if grace <= 0 {
+		delete(rbiSessionsByHost, host)
+		go rbiTeardown(name)
+		return
+	}
+	if s.teardownTimer != nil {
+		s.teardownTimer.Stop()
+	}
+	s.teardownTimer = time.AfterFunc(grace, func() {
+		rbiMu.Lock()
+		cur, ok := rbiSessionsByHost[host]
+		// Bail if the session was replaced, or a viewer reattached during grace.
+		if !ok || cur != s || cur.viewers > 0 {
+			rbiMu.Unlock()
+			return
+		}
+		delete(rbiSessionsByHost, host)
+		rbiMu.Unlock()
+		log.Printf("[rbi] last viewer left; tearing down %s", name)
+		rbiTeardown(name)
+	})
+}
+
+// rbiMultiDomainHost reports whether host is a multi-domain web app whose
+// resources span domains the single-host kiosk allowlist would block (Meet pulls
+// accounts.google.com / googlevideo / gstatic, Teams pulls *.office.net, etc.).
+// For these we relax URLBlocklist after launch. Tunable via RBI_RELAX_HOSTS.
+func rbiMultiDomainHost(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	for _, h := range strings.Split(rbiEnv("RBI_RELAX_HOSTS",
+		"meet.google.com,teams.microsoft.com,teams.live.com"), ",") {
+		h = strings.TrimSpace(strings.ToLower(h))
+		if h != "" && (host == h || strings.HasSuffix(host, "."+h)) {
+			return true
+		}
+	}
+	return false
+}
+
+// rbiDeviceScale is the Chrome device-scale-factor (page zoom) for the isolated
+// browser. The image bakes 1.25; default here is 0.75 (smaller, more fits).
+// Tunable via RBI_DEVICE_SCALE.
+func rbiDeviceScale() string {
+	if s := strings.TrimSpace(rbiEnv("RBI_DEVICE_SCALE", "0.75")); s != "" {
+		return s
+	}
+	return "0.75"
+}
+
+// rbiTuneContainer applies post-launch fixes that the prebuilt image can't do
+// (it's rebuild-locked behind the corporate VPN), then restarts Chromium ONCE so
+// they take effect:
+//   - sets the page zoom (device-scale-factor) to rbiDeviceScale() — all sites;
+//   - for multi-domain sites (Meet/Teams) clears URLBlocklist so cross-domain
+//     resources (accounts.google.com, googlevideo, *.office.net) load instead of
+//     hitting the single-host kiosk allowlist and showing "page blocked".
+// Best-effort; failures are logged, not fatal.
+func rbiTuneContainer(name, host string) {
+	scale := rbiDeviceScale()
+	sed := "sed -i -E 's/force-device-scale-factor=[0-9.]+/force-device-scale-factor=" + scale +
+		"/g' /etc/neko/supervisord/chromium.conf 2>/dev/null || true"
+	_ = exec.Command("docker", "exec", name, "sh", "-c", sed).Run()
+
+	relax := rbiMultiDomainHost(host)
+	if relax {
+		const py = "import glob,json\n" +
+			"for f in glob.glob('/etc/chromium/policies/managed/*.json')+glob.glob('/etc/opt/chrome/policies/managed/*.json'):\n" +
+			"    try:\n" +
+			"        d=json.load(open(f)); d['URLBlocklist']=[]; json.dump(d,open(f,'w'))\n" +
+			"    except Exception: pass\n"
+		if out, err := exec.Command("docker", "exec", name, "python3", "-c", py).CombinedOutput(); err != nil {
+			log.Printf("[rbi] relax kiosk %s: %v: %s", name, err, string(out))
+		}
+	}
+	// One restart picks up both the zoom and the relaxed policy.
+	_ = exec.Command("docker", "exec", name, "supervisorctl", "restart", "chromium").Run()
+	log.Printf("[rbi] tuned %s (scale=%s, relax=%v)", name, scale, relax)
+}
+
 func rbiTeardown(name string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -394,7 +661,18 @@ func rbiStartGC() {
 				var dead []*rbiSession
 				rbiMu.Lock()
 				for host, s := range rbiSessionsByHost {
-					if now.Sub(s.lastActive) > ttl || !rbiContainerRunning(s.name) {
+					// Reconciliation backstop. The primary teardown path is
+					// rbiViewerDetach (WS close). Here we only catch leaks:
+					//   - the container died out from under us, OR
+					//   - a session with NO viewer attached has gone idle past TTL
+					//     (e.g. launched but the viewer tab never connected).
+					// An attached viewer is NEVER reaped on idle — an open-but-quiet
+					// tab must not have its container pulled.
+					running := rbiContainerRunning(s.name)
+					if !running || (s.viewers == 0 && now.Sub(s.lastActive) > ttl) {
+						if s.teardownTimer != nil {
+							s.teardownTimer.Stop()
+						}
 						dead = append(dead, s)
 						delete(rbiSessionsByHost, host)
 					}

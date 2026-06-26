@@ -1,0 +1,44 @@
+# Overlay rebuild for when the neko base image (ghcr.io/m1k1o/neko/chromium) has been
+# PRUNED and the corporate VPN blocks re-pulling it — so a normal `docker build` of
+# Dockerfile fails. This builds FROM the EXISTING rbi-chrome-neko:latest (no registry
+# pull) and applies ONLY the config fixes the deployed image was missing:
+#   1. cursor: append capture.video.pipelines{show_pointer:false} to neko.yaml so the
+#      streamed video has NO baked pointer (kills the double/laggy cursor). The deployed
+#      image had show_pointer absent -> neko's default show_pointer=true -> double cursor.
+#   2. zoom: force-device-scale-factor -> 1.25 (125% default) in the kiosk conf(s); the
+#      deployed image had 0.75.
+#
+# Build (on the VM, from this dir):
+#   docker build -f Dockerfile.fix -t rbi-chrome-neko:latest .
+FROM rbi-chrome-neko:latest
+
+COPY neko-capture.yaml          /opt/rbi/neko-capture.yaml
+COPY chromium-kiosk.template.conf /opt/rbi/chromium-kiosk.template.conf
+
+# 1. cursor — merge show_pointer:false (idempotent; guard on show_pointer, not '^capture:')
+RUN if [ -f /etc/neko/neko.yaml ]; then \
+      grep -q 'show_pointer: false' /etc/neko/neko.yaml || cat /opt/rbi/neko-capture.yaml >> /etc/neko/neko.yaml ; \
+      grep -q 'show_pointer: false' /etc/neko/neko.yaml || { echo "FATAL: cursor merge failed" >&2; exit 1; } ; \
+    fi
+
+# 2. zoom — force 125% in every kiosk conf (template + any baked rendered supervisord conf)
+RUN find /opt/rbi /etc/neko -type f -name '*.conf' \
+      -exec sed -i 's/force-device-scale-factor=[0-9.]\+/force-device-scale-factor=1.25/g' {} \; 2>/dev/null || true
+
+# 3. mic + seamless chrome + real-mic override — the deployed image's /var/www/index.html lost
+# the inject-head.html injection (warmMic DOM-clicks the mic button on first gesture; __rbiReal
+# forces a real, non-virtual mic; CSS strips branding/badges and full-bleeds the video). Without
+# it the mic/voice-search never warms and the "Connected"/"took controls" badges show. Idempotent
+# guard on textarea.overlay (the marker inject-head.html adds).
+# 4. extension dir — the deployed image is MISSING /opt/rbi/ext, but the kiosk conf passes
+# --load-extension=/opt/rbi/ext, so Chromium pops "Failed to load extension ... Manifest missing"
+# and the isolated site loads behind an error dialog. Ship the ext (RBI Media Bridge) so it loads.
+COPY ext/ /opt/rbi/ext/
+
+COPY inject-head.html /opt/rbi/inject-head.html
+RUN if [ -f /var/www/index.html ]; then \
+      grep -q 'textarea.overlay' /var/www/index.html || \
+        perl -0777 -i -pe 'BEGIN{open my $h,"<","/opt/rbi/inject-head.html" or die $!; local $/; our $inj=<$h>; close $h} s{</head>}{$inj</head>}' /var/www/index.html ; \
+      sed -i 's#<title>[^<]*</title>#<title></title>#' /var/www/index.html ; \
+      grep -q 'textarea.overlay' /var/www/index.html || { echo "FATAL: head injection failed" >&2; exit 1; } ; \
+    fi
