@@ -4,10 +4,11 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"sync"
-	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -40,6 +41,21 @@ func HandleWebsocketConnection(r *http.Request, w http.ResponseWriter) {
 		return
 	}
 	defer clientConn.Close()
+
+	// RBI per-tab lifecycle: for an isolated session this WS *is* the viewer's neko
+	// signaling channel (r.URL.Host was rewritten to the container's 127.0.0.1:port
+	// by the reverse-proxy step). While this function runs the tab is open; when it
+	// returns (read error on tab close/reload/crash) the viewer is gone. Attaching
+	// here and detaching on return ties the container's life to the tab — closing
+	// the tab tears the container (and its held camera/mic) down promptly. A
+	// websocket that doesn't map to an RBI session is a harmless no-op.
+	if _, portStr, perr := net.SplitHostPort(r.URL.Host); perr == nil {
+		if port, cerr := strconv.Atoi(portStr); cerr == nil {
+			if s := rbiViewerAttach(port); s != nil {
+				defer rbiViewerDetach(port)
+			}
+		}
+	}
 	// Extract the backend URL from the request (e.g., from a query parameter).
 	backendURL := url.URL{
 		Scheme:   "ws", // Use "ws" for local neko connection
@@ -92,12 +108,12 @@ func HandleWebsocketConnection(r *http.Request, w http.ResponseWriter) {
 	go forward(clientConn, backendConn, "backend")
 	go forward(backendConn, clientConn, "client")
 
-	// Wait until one of the directions reports an error or a timeout is reached.
-	select {
-	case err := <-errChan:
-		log.Printf("Connection error occurred: %v", err)
-	case <-time.After(10 * time.Minute): // Optional: Timeout to prevent indefinite blocking.
-		log.Println("Timeout reached, closing connections")
+	// Block until EITHER direction reports an error — which is exactly when the tab
+	// closes/reloads (client read fails) or the container goes away (backend read
+	// fails). No artificial timeout: an RBI viewer session may stay open for hours,
+	// and a hard timeout here would tear down a perfectly healthy tab's container.
+	if err := <-errChan; err != nil {
+		log.Printf("websocket closed: %v", err)
 	}
 
 	// Ensure both connections are closed.

@@ -62,8 +62,11 @@ RUN if [ -f /etc/neko/neko.yaml ]; then \
 # (show_pointer:false) captures the screen without the pointer, so only the viewer's
 # own local cursor shows. Verified at build time so a bad merge fails the build.
 COPY neko-capture.yaml /opt/rbi/neko-capture.yaml
+# NOTE: guard on 'show_pointer: false' (NOT '^capture:') — neko v3.1.4's stock neko.yaml
+# may already carry a capture: section, which made the old '^capture:' guard SKIP the merge
+# so show_pointer:false was never added and the double cursor returned.
 RUN if [ -f /etc/neko/neko.yaml ]; then \
-      grep -q '^capture:' /etc/neko/neko.yaml || cat /opt/rbi/neko-capture.yaml >> /etc/neko/neko.yaml ; \
+      grep -q 'show_pointer: false' /etc/neko/neko.yaml || cat /opt/rbi/neko-capture.yaml >> /etc/neko/neko.yaml ; \
       grep -q 'show_pointer: false' /etc/neko/neko.yaml || { echo "FATAL: capture pipeline merge failed" >&2; exit 1; } ; \
     fi
 

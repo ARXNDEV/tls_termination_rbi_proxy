@@ -1,6 +1,7 @@
 package gatesentryproxy
 
 import (
+	"bufio"
 	"io"
 	"log"
 	"net"
@@ -191,13 +192,53 @@ func HandleSSLConnectDirect(r *http.Request, w http.ResponseWriter, user string,
 	ConnectDirect(conn, r.URL.Host, nil, passthru)
 }
 
+// bufferedConn wraps a net.Conn so reads first drain a bufio.Reader (used after an
+// HTTP CONNECT handshake that may have buffered a few extra bytes).
+type bufferedConn struct {
+	r *bufio.Reader
+	net.Conn
+}
+
+func (b *bufferedConn) Read(p []byte) (int, error) { return b.r.Read(p) }
+
+// dialUpstream opens a raw TCP conn to serverAddr. On a captive-portal / proxy-only
+// network (env RBI_UPSTREAM_PROXY set, e.g. "192.168.100.9:3128") it tunnels via an
+// HTTP CONNECT through that proxy, because a direct net.Dial is intercepted by the
+// captive portal. Falls back to a direct dial when RBI_UPSTREAM_PROXY is unset.
+func dialUpstream(serverAddr string) (net.Conn, error) {
+	px := strings.TrimSpace(os.Getenv("RBI_UPSTREAM_PROXY"))
+	if px == "" {
+		return net.DialTimeout("tcp", serverAddr, 15*time.Second)
+	}
+	px = strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(px, "http://"), "https://"), "/")
+	c, err := net.DialTimeout("tcp", px, 15*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("dial upstream proxy %s: %w", px, err)
+	}
+	fmt.Fprintf(c, "CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Connection: keep-alive\r\n\r\n", serverAddr, serverAddr)
+	br := bufio.NewReader(c)
+	resp, err := http.ReadResponse(br, &http.Request{Method: "CONNECT"})
+	if err != nil {
+		c.Close()
+		return nil, fmt.Errorf("upstream CONNECT %s read: %w", serverAddr, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		c.Close()
+		return nil, fmt.Errorf("upstream CONNECT %s: %s", serverAddr, resp.Status)
+	}
+	if br.Buffered() > 0 {
+		return &bufferedConn{r: br, Conn: c}, nil
+	}
+	return c, nil
+}
+
 // ConnectDirect connects to serverAddr and copies data between it and conn.
 // extraData is sent to the server first.
 func ConnectDirect(conn net.Conn, serverAddr string, extraData []byte, gpt *GSProxyPassthru) (uploaded, downloaded int64) {
 	// activeConnections.Add(1)
 	// defer activeConnections.Done()
 	log.Println("Running a CONNECTDIRECT TCP to " + serverAddr)
-	serverConn, err := net.Dial("tcp", serverAddr)
+	serverConn, err := dialUpstream(serverAddr)
 
 	if err != nil {
 		log.Printf("error with pass-through of SSL connection to %s: %s", serverAddr, err)
@@ -343,12 +384,19 @@ func SSLBump(conn net.Conn, serverAddr, user, authUser string, r *http.Request, 
 
 	if !cachedCert {
 		log.Println("[SSL] Starting process to cache certificate")
-		serverConn, err := tls.Dial("tcp", serverAddr, &tls.Config{
+		rawUpstream, err := dialUpstream(serverAddr)
+		if err != nil {
+			GSLogSSL(user, serverAddr, serverName, err, true)
+			ConnectDirect(conn, serverAddr, clientHello, gpt)
+			return
+		}
+		serverConn := tls.Client(rawUpstream, &tls.Config{
 			ServerName:         serverName,
 			InsecureSkipVerify: false,
 			NextProtos:         []string{"h2", "http/1.1"},
 		})
-		if err != nil {
+		if err = serverConn.Handshake(); err != nil {
+			rawUpstream.Close()
 			GSLogSSL(user, serverAddr, serverName, err, true)
 			// conf = nil
 			ConnectDirect(conn, serverAddr, clientHello, gpt)
